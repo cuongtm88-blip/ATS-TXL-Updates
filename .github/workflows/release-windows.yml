@@ -45,7 +45,10 @@ jobs:
         run: |
           & ".\\dist\\ATS-TXL.exe" --self-test
           $windowedExit = $LASTEXITCODE
-          if ($windowedExit -ne 0) {
+          # A Windows GUI-subsystem application does not always populate
+          # $LASTEXITCODE in PowerShell. Treat only an explicit non-zero
+          # value as a failed startup.
+          if (($null -ne $windowedExit) -and ($windowedExit -ne 0)) {
             Write-Host "Windowed EXE failed; building a console diagnostic copy..."
             python -m PyInstaller --noconfirm --clean --onefile --console --collect-all playwright --name ATS-TXL-diagnostic app.py
             & ".\\dist\\ATS-TXL-diagnostic.exe" --self-test
