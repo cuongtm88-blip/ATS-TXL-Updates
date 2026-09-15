@@ -30,6 +30,10 @@ jobs:
           python -m pip install -r requirements-build.txt
           python -m playwright install chromium
 
+      - name: Smoke-test source imports
+        shell: pwsh
+        run: python app.py --self-test
+
       - name: Build ATS-TXL.exe
         shell: pwsh
         run: |
@@ -40,7 +44,12 @@ jobs:
         shell: pwsh
         run: |
           & ".\\dist\\ATS-TXL.exe" --self-test
-          if ($LASTEXITCODE -ne 0) { throw "Frozen ATS-TXL.exe could not start" }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Windowed EXE failed; building a console diagnostic copy..."
+            python -m PyInstaller --noconfirm --clean --onefile --console --collect-all playwright --name ATS-TXL-diagnostic app.py
+            & ".\\dist\\ATS-TXL-diagnostic.exe" --self-test
+            throw "Frozen ATS-TXL.exe could not start (windowed exit code: $LASTEXITCODE)"
+          }
 
       - name: Create SHA-256 and read version
         id: version
