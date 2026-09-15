@@ -1,0 +1,25 @@
+# Local secrets and per-machine application state
+settings.json
+chrome-profile/
+downloads/
+
+# Python and build output
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+
+# macOS / Microsoft Office local files
+.DS_Store
+~$*.docx
+
+# Local reports and legacy binary are not part of the public source release
+*.docx
+*.xlsx
+*.xls
+MonitorTXL-1.exe
+
+# The Windows handoff folder mirrors the root source for manual use only.
+ATS-TXL-Windows/
