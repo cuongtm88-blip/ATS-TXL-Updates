@@ -1167,6 +1167,5 @@ if __name__ == "__main__":
     # EXE can load Python, Playwright and the application's imports without
     # opening a GUI or requiring OneBSS/Telegram configuration.
     if "--self-test" in sys.argv:
-        print(f"ATS TXL {APP_VERSION}: self-test passed")
         raise SystemExit(0)
     ATSApp().mainloop()
