@@ -103,9 +103,9 @@ Mỗi lần phát hành bản mới trên máy Windows dùng để build:
 5. Chạy `publish_windows_release.bat`, nhập `PHAT HANH` khi được hỏi. Lần đầu,
    script tự cài GitHub CLI nếu cần và mở trình duyệt để đăng nhập GitHub.
 
-Repository cập nhật chỉ nhận EXE, SHA-256 và nội dung release; không đưa mã
-nguồn, `settings.json`, token hay Chat ID lên GitHub. Script từ chối ghi đè một
-phiên bản đã phát hành, nên bắt buộc tăng `APP_VERSION` cho mỗi lần cập nhật.
+Repository công khai chứa mã nguồn và các bản phát hành. Các tệp cấu hình cục
+bộ, `settings.json`, token và Chat ID không được đưa lên GitHub. Mỗi phiên bản
+phát hành cần tăng `APP_VERSION` để máy cài đặt nhận ra bản mới.
 
 ### Build tự động bằng GitHub Actions
 
