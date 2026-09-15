@@ -19,7 +19,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # Python 3.11 produces a frozen executable that is compatible with
+          # a wider range of deployed Windows systems.
+          python-version: "3.11"
 
       - name: Install dependencies and Chromium
         shell: pwsh
@@ -33,6 +35,12 @@ jobs:
         run: |
           python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all playwright --name ATS-TXL app.py
           if (!(Test-Path "dist/ATS-TXL.exe")) { throw "PyInstaller did not create ATS-TXL.exe" }
+
+      - name: Smoke-test frozen EXE
+        shell: pwsh
+        run: |
+          & ".\\dist\\ATS-TXL.exe" --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Frozen ATS-TXL.exe could not start" }
 
       - name: Create SHA-256 and read version
         id: version
