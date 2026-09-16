@@ -18,9 +18,11 @@ from tkinter import messagebox, ttk
 import requests
 
 try:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     from playwright.sync_api import sync_playwright
 except ImportError:  # pragma: no cover - friendly message at runtime
     sync_playwright = None
+    PlaywrightTimeoutError = RuntimeError
 
 import TXL_Monitor_Tele_Group_All_Over10 as txl
 import updater
@@ -53,6 +55,7 @@ else:
     DOWNLOADS = ROOT / "downloads"
 ONEBSS_URL = "https://onebss.vnpt.vn/"
 INCIDENT_INVENTORY_URL = ONEBSS_URL + "#/htkh/ManagementIncidentInventory?tag=2"
+MAX_EXCEL_DOWNLOAD_RECOVERY_ATTEMPTS = 1
 
 
 def _load_settings():
@@ -822,15 +825,7 @@ class ATSApp(tk.Tk):
                     self._ensure_onebss_session_active(page)
                     if cycle > 1:
                         self.write_log(f"Bắt đầu chu kỳ tự động lần {cycle}.")
-                    # Filters are configured once from a clean state. Refresh
-                    # only the dates before each run so tree checkboxes are not
-                    # toggled by repeated configuration.
-                    today = time.strftime("%d/%m/%Y")
-                    self.current_stage = f"Chu kỳ {cycle}: cập nhật ngày và bộ lọc"
-                    self._fill_date(page, today, 0)
-                    self._fill_date(page, today, 1)
-                    self.current_stage = f"Chu kỳ {cycle}: tìm kiếm và xuất Excel"
-                    excel = self._export_excel(page)
+                    excel = self._export_excel_with_recovery(page, cycle)
                     self.current_stage = f"Chu kỳ {cycle}: xử lý dữ liệu và gửi Telegram"
                     self._process_and_send(excel)
                     self.write_log("Hoàn tất quy trình.")
@@ -931,10 +926,7 @@ class ATSApp(tk.Tk):
 
     def _configure_filters(self, page):
         self.write_log("Đang cấu hình ngày và bộ lọc theo ảnh mẫu...")
-        today = time.strftime("%d/%m/%Y")
-        self.after(0, lambda: (self.from_date.set(today), self.to_date.set(today)))
-        self._fill_date(page, today, 0)
-        self._fill_date(page, today, 1)
+        self._refresh_cycle_dates(page)
 
         self._ensure_all_statuses(page)
 
@@ -1048,10 +1040,24 @@ class ATSApp(tk.Tk):
             pass
         raise RuntimeError(f'Không tìm thấy mục OneBSS: "{text}". Hãy kiểm tra đã đăng nhập và trang đã tải xong.')
 
+    def _refresh_cycle_dates(self, page):
+        """Apply today's date to OneBSS and keep the desktop UI in sync."""
+        today = time.strftime("%d/%m/%Y")
+        self.after(0, lambda: (self.from_date.set(today), self.to_date.set(today)))
+        self._fill_date(page, today, 0)
+        self._fill_date(page, today, 1)
+        return today
+
     def _fill_date(self, page, value, index):
         inputs = page.locator('input.mx-input, input[type="date"], input[placeholder*="ngày"], input[placeholder*="Ngày"]')
-        if inputs.count() > index:
-            inputs.nth(index).fill(value)
+        if inputs.count() <= index:
+            raise RuntimeError("Không tìm thấy ô ngày trên màn hình OneBSS")
+        date_input = inputs.nth(index)
+        date_input.fill(value)
+        # OneBSS uses a reactive date widget. Blur commits the changed value
+        # before the next search, especially when the calendar date rolls over.
+        date_input.press("Tab")
+        page.wait_for_timeout(150)
 
     def _check_text(self, page, label):
         loc = page.get_by_text(label, exact=True)
@@ -1088,6 +1094,46 @@ class ATSApp(tk.Tk):
         download.save_as(str(target))
         self.write_log(f"Đã lưu Excel: {target}")
         return target
+
+    @staticmethod
+    def _is_excel_download_timeout(exc):
+        return 'event "download"' in str(exc).lower()
+
+    def _recover_onebss_after_download_timeout(self, page, cycle, recovery_attempt):
+        self.current_stage = f"Chu kỳ {cycle}: phục hồi OneBSS sau lỗi xuất Excel"
+        self.write_log(
+            "OneBSS không tạo file Excel sau 2 phút. "
+            f"Đang làm mới trang và cấu hình lại (lần {recovery_attempt}/"
+            f"{MAX_EXCEL_DOWNLOAD_RECOVERY_ATTEMPTS})..."
+        )
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(1500)
+        self._ensure_onebss_session_active(page)
+        # Navigate again and configure every filter from a clean state. This
+        # is deliberately not just a retry of the Export button.
+        self._navigate_onebss(page)
+        self._ensure_onebss_session_active(page)
+        self.write_log("Đã phục hồi OneBSS; chạy lại tìm kiếm và xuất Excel.")
+
+    def _export_excel_with_recovery(self, page, cycle):
+        """Export once, then fully refresh/reconfigure OneBSS after no download."""
+        recovery_attempt = 0
+        while True:
+            self.current_stage = f"Chu kỳ {cycle}: cập nhật ngày và bộ lọc"
+            self._refresh_cycle_dates(page)
+            self.current_stage = f"Chu kỳ {cycle}: tìm kiếm và xuất Excel"
+            try:
+                return self._export_excel(page)
+            except PlaywrightTimeoutError as exc:
+                if (
+                    not self._is_excel_download_timeout(exc)
+                    or recovery_attempt >= MAX_EXCEL_DOWNLOAD_RECOVERY_ATTEMPTS
+                ):
+                    raise
+                recovery_attempt += 1
+                self._recover_onebss_after_download_timeout(
+                    page, cycle, recovery_attempt
+                )
 
     def _wait_for_search_complete(self, page, timeout_seconds=600):
         """Wait until OneBSS finishes loading every record.
