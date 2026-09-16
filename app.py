@@ -18,11 +18,13 @@ from tkinter import messagebox, ttk
 import requests
 
 try:
+    from playwright._impl._errors import TargetClosedError
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     from playwright.sync_api import sync_playwright
 except ImportError:  # pragma: no cover - friendly message at runtime
     sync_playwright = None
     PlaywrightTimeoutError = RuntimeError
+    TargetClosedError = RuntimeError
 
 import TXL_Monitor_Tele_Group_All_Over10 as txl
 import updater
@@ -55,7 +57,7 @@ else:
     DOWNLOADS = ROOT / "downloads"
 ONEBSS_URL = "https://onebss.vnpt.vn/"
 INCIDENT_INVENTORY_URL = ONEBSS_URL + "#/htkh/ManagementIncidentInventory?tag=2"
-MAX_EXCEL_DOWNLOAD_RECOVERY_ATTEMPTS = 1
+MAX_EXCEL_RECOVERY_ATTEMPTS = 1
 
 
 def _load_settings():
@@ -825,7 +827,10 @@ class ATSApp(tk.Tk):
                     self._ensure_onebss_session_active(page)
                     if cycle > 1:
                         self.write_log(f"Bắt đầu chu kỳ tự động lần {cycle}.")
-                    excel = self._export_excel_with_recovery(page, cycle)
+                    ctx, page, excel = self._export_excel_with_recovery(
+                        p, ctx, page, cycle
+                    )
+                    self.browser_context, self.browser_page = ctx, page
                     self.current_stage = f"Chu kỳ {cycle}: xử lý dữ liệu và gửi Telegram"
                     self._process_and_send(excel)
                     self.write_log("Hoàn tất quy trình.")
@@ -1104,7 +1109,7 @@ class ATSApp(tk.Tk):
         self.write_log(
             "OneBSS không tạo file Excel sau 2 phút. "
             f"Đang làm mới trang và cấu hình lại (lần {recovery_attempt}/"
-            f"{MAX_EXCEL_DOWNLOAD_RECOVERY_ATTEMPTS})..."
+            f"{MAX_EXCEL_RECOVERY_ATTEMPTS})..."
         )
         page.reload(wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(1500)
@@ -1115,25 +1120,63 @@ class ATSApp(tk.Tk):
         self._ensure_onebss_session_active(page)
         self.write_log("Đã phục hồi OneBSS; chạy lại tìm kiếm và xuất Excel.")
 
-    def _export_excel_with_recovery(self, page, cycle):
-        """Export once, then fully refresh/reconfigure OneBSS after no download."""
+    @staticmethod
+    def _is_browser_closed_error(exc):
+        return isinstance(exc, TargetClosedError) or (
+            "target page, context or browser has been closed" in str(exc).lower()
+        )
+
+    def _recover_closed_browser(self, playwright, context, cycle, recovery_attempt):
+        """Replace a crashed/closed context and restore the OneBSS workspace."""
+        self.current_stage = f"Chu kỳ {cycle}: phục hồi Chromium sau khi bị đóng"
+        self.write_log(
+            "Chromium/OneBSS đã bị đóng khi xuất Excel. "
+            f"Đang mở lại và cấu hình lại (lần {recovery_attempt}/"
+            f"{MAX_EXCEL_RECOVERY_ATTEMPTS})..."
+        )
+        try:
+            context.close()
+        except Exception:
+            pass
+
+        new_context = self._launch_browser_context(playwright)
+        new_page = new_context.pages[0] if new_context.pages else new_context.new_page()
+        self.browser_context, self.browser_page = new_context, new_page
+        new_page.goto(ONEBSS_URL, wait_until="domcontentloaded", timeout=30000)
+        self._ensure_onebss_session_active(new_page)
+        self._navigate_onebss(new_page)
+        self._ensure_onebss_session_active(new_page)
+        self.write_log("Đã mở lại OneBSS và cấu hình xong; chạy lại tìm kiếm và xuất Excel.")
+        return new_context, new_page
+
+    def _export_excel_with_recovery(self, playwright, context, page, cycle):
+        """Export once, then recover from an absent download or closed browser."""
         recovery_attempt = 0
         while True:
             self.current_stage = f"Chu kỳ {cycle}: cập nhật ngày và bộ lọc"
             self._refresh_cycle_dates(page)
             self.current_stage = f"Chu kỳ {cycle}: tìm kiếm và xuất Excel"
             try:
-                return self._export_excel(page)
-            except PlaywrightTimeoutError as exc:
+                return context, page, self._export_excel(page)
+            except Exception as exc:
+                recover_download = isinstance(exc, PlaywrightTimeoutError) and (
+                    self._is_excel_download_timeout(exc)
+                )
+                recover_browser = self._is_browser_closed_error(exc) or page.is_closed()
                 if (
-                    not self._is_excel_download_timeout(exc)
-                    or recovery_attempt >= MAX_EXCEL_DOWNLOAD_RECOVERY_ATTEMPTS
+                    not (recover_download or recover_browser)
+                    or recovery_attempt >= MAX_EXCEL_RECOVERY_ATTEMPTS
                 ):
                     raise
                 recovery_attempt += 1
-                self._recover_onebss_after_download_timeout(
-                    page, cycle, recovery_attempt
-                )
+                if recover_browser:
+                    context, page = self._recover_closed_browser(
+                        playwright, context, cycle, recovery_attempt
+                    )
+                else:
+                    self._recover_onebss_after_download_timeout(
+                        page, cycle, recovery_attempt
+                    )
 
     def _wait_for_search_complete(self, page, timeout_seconds=600):
         """Wait until OneBSS finishes loading every record.
