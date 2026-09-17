@@ -1,4 +1,6 @@
-playwright>=1.45,<2
+# Pin the browser automation runtime so a future build does not silently
+# change the Chromium version used by a 24/7 deployment.
+playwright==1.63.0
 pandas>=2.0,<3
 openpyxl>=3.1,<4
 requests>=2.31,<3

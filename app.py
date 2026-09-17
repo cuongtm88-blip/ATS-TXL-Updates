@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -58,6 +59,7 @@ else:
 ONEBSS_URL = "https://onebss.vnpt.vn/"
 INCIDENT_INVENTORY_URL = ONEBSS_URL + "#/htkh/ManagementIncidentInventory?tag=2"
 MAX_EXCEL_RECOVERY_ATTEMPTS = 1
+DIAGNOSTICS_DIRNAME = "diagnostics"
 
 
 def _load_settings():
@@ -142,6 +144,11 @@ class ATSApp(tk.Tk):
         self.current_stage = "Khởi tạo ứng dụng"
         self.browser_context = None
         self.browser_page = None
+        self.browser_backend = "playwright-chromium"
+        self._active_export_diagnostic = None
+        self._diagnostic_context_ids = set()
+        self._diagnostic_page_ids = set()
+        self._last_diagnostic_path = None
         self.start_event = None
         self.update_in_progress = False
         self._build_ui()
@@ -798,6 +805,199 @@ class ATSApp(tk.Tk):
         if failures:
             self.write_log(f"Có {len(failures)} người nhận cảnh báo lỗi không thành công.")
 
+    @staticmethod
+    def _safe_page_url(page):
+        try:
+            return page.url
+        except Exception:
+            return "<không đọc được URL>"
+
+    def _record_diagnostic_event(self, context, event_name, **details):
+        """Keep a small in-memory event timeline for the current Export only."""
+        active = self._active_export_diagnostic
+        if not active or active.get("context") is not context:
+            return
+        active["events"].append(
+            {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "event": event_name,
+                **{key: str(value)[:2000] for key, value in details.items()},
+            }
+        )
+
+    def _attach_page_diagnostics(self, context, page):
+        page_id = id(page)
+        if page_id in self._diagnostic_page_ids:
+            return
+        self._diagnostic_page_ids.add(page_id)
+        page.on(
+            "crash",
+            lambda: self._record_diagnostic_event(
+                context, "page-crash", url=self._safe_page_url(page)
+            ),
+        )
+        page.on(
+            "close",
+            lambda: self._record_diagnostic_event(
+                context, "page-close", url=self._safe_page_url(page)
+            ),
+        )
+        page.on(
+            "pageerror",
+            lambda error: self._record_diagnostic_event(
+                context, "page-error", message=error, url=self._safe_page_url(page)
+            ),
+        )
+
+        def record_console(message):
+            if message.type in ("error", "warning"):
+                self._record_diagnostic_event(
+                    context,
+                    "console-" + message.type,
+                    message=message.text,
+                    url=self._safe_page_url(page),
+                )
+
+        page.on("console", record_console)
+
+    def _attach_context_diagnostics(self, context, page):
+        """Subscribe once to browser events needed to identify an Export failure."""
+        context_id = id(context)
+        if context_id not in self._diagnostic_context_ids:
+            self._diagnostic_context_ids.add(context_id)
+            context.on(
+                "close",
+                lambda: self._record_diagnostic_event(context, "context-close"),
+            )
+            context.on(
+                "page",
+                lambda new_page: self._attach_page_diagnostics(context, new_page),
+            )
+            context.on(
+                "requestfailed",
+                lambda request: self._record_diagnostic_event(
+                    context,
+                    "request-failed",
+                    url=request.url,
+                    failure=request.failure,
+                ),
+            )
+            context.on(
+                "weberror",
+                lambda error: self._record_diagnostic_event(
+                    context, "web-error", message=error.error
+                ),
+            )
+            try:
+                browser = context.browser
+                if browser:
+                    browser.on(
+                        "disconnected",
+                        lambda: self._record_diagnostic_event(
+                            context, "browser-disconnected"
+                        ),
+                    )
+            except Exception:
+                pass
+        self._attach_page_diagnostics(context, page)
+
+    def _begin_export_diagnostic(self, context, page):
+        self._active_export_diagnostic = {
+            "id": uuid.uuid4().hex[:10],
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "context": context,
+            "backend": self.browser_backend,
+            "page_url": self._safe_page_url(page),
+            "events": [],
+            "trace_started": False,
+        }
+        self._attach_context_diagnostics(context, page)
+        try:
+            context.tracing.start(screenshots=True, snapshots=True, sources=True)
+            self._active_export_diagnostic["trace_started"] = True
+        except Exception as exc:
+            self._record_diagnostic_event(context, "trace-start-failed", message=exc)
+
+    @staticmethod
+    def _windows_crash_events():
+        if sys.platform != "win32":
+            return "Không áp dụng: không phải Windows."
+        command = (
+            "$since=(Get-Date).AddMinutes(-10);"
+            "$events=Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=$since} "
+            "-ErrorAction SilentlyContinue | Where-Object {"
+            "$_.ProviderName -match 'Application Error|Windows Error Reporting' -or "
+            "$_.Message -match 'chrome|chromium|msedge|ATS-TXL'"
+            "} | Select-Object TimeCreated,ProviderName,Id,LevelDisplayName,Message;"
+            "$events | ConvertTo-Json -Depth 3"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    command,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            return result.stdout.strip() or result.stderr.strip() or "Không có sự kiện phù hợp."
+        except Exception as exc:
+            return f"Không đọc được Windows Event Log: {exc}"
+
+    def _finish_export_diagnostic(self, context, page, exc=None):
+        active = self._active_export_diagnostic
+        if not active or active.get("context") is not context:
+            return None
+        self._active_export_diagnostic = None
+
+        if exc is None:
+            try:
+                if active["trace_started"]:
+                    context.tracing.stop()
+            except Exception:
+                pass
+            return None
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        folder = APP_DATA / DIAGNOSTICS_DIRNAME / f"export_{timestamp}_{active['id']}"
+        folder.mkdir(parents=True, exist_ok=True)
+        trace_path = folder / "playwright-trace.zip"
+        trace_error = ""
+        if active["trace_started"]:
+            try:
+                context.tracing.stop(path=str(trace_path))
+            except Exception as trace_exc:
+                trace_error = str(trace_exc)
+
+        summary = {
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "error": str(exc),
+            "stage": self.current_stage,
+            "browser_backend": active["backend"],
+            "export_started_at": active["started_at"],
+            "page_url_before_export": active["page_url"],
+            "page_url_after_error": self._safe_page_url(page),
+            "trace_path": str(trace_path) if trace_path.exists() else "",
+            "trace_error": trace_error,
+        }
+        (folder / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (folder / "browser-events.json").write_text(
+            json.dumps(active["events"], ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (folder / "windows-events.json").write_text(
+            self._windows_crash_events(), encoding="utf-8"
+        )
+        self._last_diagnostic_path = folder
+        self.write_log(f"Đã lưu gói chẩn đoán Export: {folder}")
+        return folder
+
     def _session_workflow(self):
         try:
             self.current_stage = "Khởi tạo Playwright và Chromium"
@@ -850,6 +1050,8 @@ class ATSApp(tk.Tk):
         except Exception as exc:
             self.write_log(f"LỖI: {exc}")
             error_text = str(exc)
+            if self._last_diagnostic_path:
+                error_text += f"\nGói chẩn đoán: {self._last_diagnostic_path}"
             if not self.stop_requested:
                 self._send_workflow_error_alert(error_text)
             self.after(0, lambda error_text=error_text: messagebox.showerror("ATS TXL", error_text))
@@ -890,7 +1092,15 @@ class ATSApp(tk.Tk):
                 "Phiên đăng nhập OneBSS đã hết hạn. Hãy mở ứng dụng và đăng nhập lại OneBSS."
             )
 
-    def _launch_browser_context(self, playwright, *, headless=False, profile=PROFILE):
+    def _launch_browser_context(
+        self,
+        playwright,
+        *,
+        headless=False,
+        profile=PROFILE,
+        browser_channel=None,
+        use_configured_channel=True,
+    ):
         """Launch the Playwright-matched browser instead of system Chrome.
 
         The installed Google Chrome channel can be newer than the Playwright
@@ -904,9 +1114,11 @@ class ATSApp(tk.Tk):
             "viewport": {"width": 1440, "height": 900},
         }
         Path(profile).mkdir(parents=True, exist_ok=True)
-        browser_channel = os.getenv("ATS_BROWSER_CHANNEL", "").strip()
+        if browser_channel is None and use_configured_channel:
+            browser_channel = os.getenv("ATS_BROWSER_CHANNEL", "").strip() or None
         if browser_channel:
             options["channel"] = browser_channel
+        self.browser_backend = browser_channel or "playwright-chromium"
         return playwright.chromium.launch_persistent_context(str(profile), **options)
 
     def _navigate_onebss(self, page):
@@ -1084,21 +1296,28 @@ class ATSApp(tk.Tk):
             except Exception:
                 continue
 
-    def _export_excel(self, page):
+    def _export_excel(self, page, context):
         if page.is_closed():
             raise RuntimeError("Trình duyệt đã đóng. Hãy bấm nút 1 để mở lại OneBSS.")
         self._ensure_onebss_session_active(page)
-        self.write_log("Bấm Tìm kiếm và chờ tải hết phiếu...")
-        page.get_by_text("Tìm kiếm", exact=True).click(timeout=15000)
-        self._wait_for_search_complete(page)
-        self.write_log("Bấm Xuất Excel...")
-        with page.expect_download(timeout=120000) as download_info:
-            page.get_by_text("Xuất Excel", exact=True).click(timeout=15000)
-        download = download_info.value
-        target = DOWNLOADS / ("Bao_hong_ton_" + time.strftime("%Y%m%d%H%M%S") + ".xlsx")
-        download.save_as(str(target))
-        self.write_log(f"Đã lưu Excel: {target}")
-        return target
+        self._last_diagnostic_path = None
+        self._begin_export_diagnostic(context, page)
+        try:
+            self.write_log("Bấm Tìm kiếm và chờ tải hết phiếu...")
+            page.get_by_text("Tìm kiếm", exact=True).click(timeout=15000)
+            self._wait_for_search_complete(page)
+            self.write_log("Bấm Xuất Excel...")
+            with page.expect_download(timeout=120000) as download_info:
+                page.get_by_text("Xuất Excel", exact=True).click(timeout=15000)
+            download = download_info.value
+            target = DOWNLOADS / ("Bao_hong_ton_" + time.strftime("%Y%m%d%H%M%S") + ".xlsx")
+            download.save_as(str(target))
+            self._finish_export_diagnostic(context, page)
+            self.write_log(f"Đã lưu Excel: {target}")
+            return target
+        except Exception as exc:
+            self._finish_export_diagnostic(context, page, exc)
+            raise
 
     @staticmethod
     def _is_excel_download_timeout(exc):
@@ -1139,15 +1358,44 @@ class ATSApp(tk.Tk):
         except Exception:
             pass
 
-        new_context = self._launch_browser_context(playwright)
-        new_page = new_context.pages[0] if new_context.pages else new_context.new_page()
-        self.browser_context, self.browser_page = new_context, new_page
-        new_page.goto(ONEBSS_URL, wait_until="domcontentloaded", timeout=30000)
-        self._ensure_onebss_session_active(new_page)
-        self._navigate_onebss(new_page)
-        self._ensure_onebss_session_active(new_page)
-        self.write_log("Đã mở lại OneBSS và cấu hình xong; chạy lại tìm kiếm và xuất Excel.")
-        return new_context, new_page
+        # A repeated failure at Export can be specific to the bundled Chromium.
+        # On Windows, try the locally installed Chrome, then Edge, before
+        # falling back to Playwright Chromium. All candidates reuse the same
+        # automation profile so an active OneBSS session is retained.
+        channels = ("chrome", "msedge", None) if sys.platform == "win32" else (None,)
+        last_error = None
+        for channel in channels:
+            backend = channel or "playwright-chromium"
+            new_context = None
+            try:
+                self.write_log(f"Đang mở lại OneBSS bằng {backend}...")
+                new_context = self._launch_browser_context(
+                    playwright,
+                    browser_channel=channel,
+                    use_configured_channel=False,
+                )
+                new_page = (
+                    new_context.pages[0] if new_context.pages else new_context.new_page()
+                )
+                self.browser_context, self.browser_page = new_context, new_page
+                new_page.goto(ONEBSS_URL, wait_until="domcontentloaded", timeout=30000)
+                self._ensure_onebss_session_active(new_page)
+                self._navigate_onebss(new_page)
+                self._ensure_onebss_session_active(new_page)
+                self.write_log(
+                    f"Đã mở lại OneBSS bằng {backend} và cấu hình xong; "
+                    "chạy lại tìm kiếm và xuất Excel."
+                )
+                return new_context, new_page
+            except Exception as exc:
+                last_error = exc
+                self.write_log(f"Không mở được OneBSS bằng {backend}: {exc}")
+                try:
+                    if new_context:
+                        new_context.close()
+                except Exception:
+                    pass
+        raise RuntimeError(f"Không thể khởi chạy lại OneBSS sau lỗi browser: {last_error}")
 
     def _export_excel_with_recovery(self, playwright, context, page, cycle):
         """Export once, then recover from an absent download or closed browser."""
@@ -1157,7 +1405,7 @@ class ATSApp(tk.Tk):
             self._refresh_cycle_dates(page)
             self.current_stage = f"Chu kỳ {cycle}: tìm kiếm và xuất Excel"
             try:
-                return context, page, self._export_excel(page)
+                return context, page, self._export_excel(page, context)
             except Exception as exc:
                 recover_download = isinstance(exc, PlaywrightTimeoutError) and (
                     self._is_excel_download_timeout(exc)
