@@ -25,7 +25,6 @@ PrivilegesRequired=admin
 CloseApplications=yes
 RestartApplications=yes
 UninstallDisplayName=ATS TXL
-UninstallDisplayVersion={#MyAppVersion}
 
 [Languages]
 Name: "vietnamese"; MessagesFile: "compiler:Languages\Vietnamese.isl"
