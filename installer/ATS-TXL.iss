@@ -26,9 +26,6 @@ CloseApplications=yes
 RestartApplications=yes
 UninstallDisplayName=ATS TXL
 
-[Languages]
-Name: "vietnamese"; MessagesFile: "compiler:Languages\Vietnamese.isl"
-
 [Files]
 Source: "{#MySourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
