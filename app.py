@@ -58,7 +58,9 @@ else:
     DOWNLOADS = ROOT / "downloads"
 ONEBSS_URL = "https://onebss.vnpt.vn/"
 INCIDENT_INVENTORY_URL = ONEBSS_URL + "#/htkh/ManagementIncidentInventory?tag=2"
-MAX_EXCEL_RECOVERY_ATTEMPTS = 1
+# A browser can crash again immediately after the first recovery.  Keep enough
+# attempts to rotate through the available Windows backends once.
+MAX_EXCEL_RECOVERY_ATTEMPTS = 3
 DIAGNOSTICS_DIRNAME = "diagnostics"
 
 
@@ -208,9 +210,9 @@ class ATSApp(tk.Tk):
 
         actions = ttk.Frame(self)
         actions.pack(fill="x", **pad)
-        self.start_btn = ttk.Button(actions, text="1. Mở Chrome / OneBSS", command=self.open_browser)
+        self.start_btn = ttk.Button(actions, text="1. Mở OneBSS / đăng nhập", command=self.open_browser)
         self.start_btn.pack(side="left", padx=4)
-        self.run_btn = ttk.Button(actions, text="2. Chạy quy trình", command=self.run_workflow)
+        self.run_btn = ttk.Button(actions, text="2. Cấu hình & chạy", command=self.run_workflow)
         self.run_btn.pack(side="left", padx=4)
         ttk.Button(actions, text="Dừng", command=self.request_stop).pack(side="left", padx=4)
         ttk.Checkbutton(actions, text="Tự động lặp sau", variable=self.schedule_enabled).pack(side="left", padx=(12, 4))
@@ -229,7 +231,7 @@ class ATSApp(tk.Tk):
         log_frame.pack(fill="both", expand=True, **pad)
         self.log = tk.Text(log_frame, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True, padx=6, pady=6)
-        self.write_log("Sẵn sàng. Hãy mở Chrome và đăng nhập OneBSS.")
+        self.write_log("Bước 1: mở OneBSS và tự đăng nhập/nhập OTP. Bước 2: cấu hình và chạy quy trình.")
 
     def write_log(self, text):
         self.after(0, self._append_log, text)
@@ -507,23 +509,8 @@ class ATSApp(tk.Tk):
         if self.worker and self.worker.is_alive():
             self.write_log("Chrome đã mở. Hãy đăng nhập rồi bấm nút 2.")
             return
-        try:
-            self._error_recipient_ids = _parse_recipient_chat_ids(
-                self.error_recipient_chat_ids.get()
-            )
-        except ValueError as exc:
-            messagebox.showerror("Chat ID nhận cảnh báo lỗi", str(exc))
-            return
-        self._telegram_token_for_alerts = self.telegram_token.get().strip()
-        if self._error_recipient_ids and not self._telegram_token_for_alerts:
-            messagebox.showerror(
-                "Thiếu Telegram Bot token",
-                "Cần nhập Telegram Bot token để gửi cảnh báo lỗi riêng.",
-            )
-            return
         self.stop_requested = False
         self.start_event = threading.Event()
-        self._acquire_keep_awake()
         self.worker = threading.Thread(target=self._session_workflow, daemon=True)
         self.worker.start()
 
@@ -538,7 +525,7 @@ class ATSApp(tk.Tk):
             if self.start_event:
                 if not self._apply_telegram_config():
                     return
-                self.write_log("Bắt đầu quy trình tự động...")
+                self.write_log("Đã nhận bước 2. Đang kiểm tra đăng nhập, cấu hình OneBSS và chạy quy trình...")
                 self.start_event.set()
             return
         self.write_log("Hãy bấm nút 1 để mở Chrome trước.")
@@ -1010,16 +997,30 @@ class ATSApp(tk.Tk):
                 self.browser_context, self.browser_page = ctx, page
                 self.current_stage = "Mở OneBSS"
                 page.goto(ONEBSS_URL, wait_until="domcontentloaded")
-                self.write_log("Chrome đã mở. Hãy đăng nhập OneBSS; chương trình sẽ tự mở trang kiểm soát.")
-                self.current_stage = "Chờ người dùng đăng nhập OneBSS"
-                self._wait_for_login(page)
-                self.current_stage = "Mở màn hình và cấu hình bộ lọc OneBSS"
-                self._navigate_onebss(page)
-                self.write_log("Đã vào trang Kiểm soát tồn báo hỏng CNTT. Kiểm tra cấu hình rồi bấm nút 2.")
-                self.current_stage = "Chờ bắt đầu quy trình"
-                self.start_event.wait()
+                self.write_log(
+                    "Bước 1 hoàn tất: OneBSS đã mở. Hãy tự đăng nhập và nhập OTP; "
+                    "chương trình sẽ không tự làm mới hoặc chuyển trang ở bước này."
+                )
+                self.current_stage = "Chờ người dùng hoàn tất đăng nhập và bấm bước 2"
+                while not self.stop_requested:
+                    self.start_event.wait()
+                    if self.stop_requested:
+                        return
+                    if not self._onebss_session_expired(page):
+                        break
+                    self.write_log(
+                        "OneBSS chưa đăng nhập xong. Hãy hoàn tất OTP, rồi bấm lại bước 2; "
+                        "trang hiện tại được giữ nguyên."
+                    )
+                    self.start_event.clear()
                 if self.stop_requested:
                     return
+                self.current_stage = "Bước 2: kiểm tra phiên đăng nhập OneBSS"
+                self._ensure_onebss_session_active(page)
+                self._acquire_keep_awake()
+                self.current_stage = "Bước 2: mở màn hình và cấu hình bộ lọc OneBSS"
+                self._navigate_onebss(page)
+                self.write_log("Đã vào trang Kiểm soát tồn báo hỏng CNTT và cấu hình bộ lọc. Bắt đầu chạy.")
                 self.after(0, lambda: self.progress.start(10))
                 cycle = 1
                 while not self.stop_requested:
@@ -1059,16 +1060,6 @@ class ATSApp(tk.Tk):
             self.current_stage = "Đã dừng"
             self.after(0, self.progress.stop)
             self.after(0, self._release_keep_awake)
-
-    def _wait_for_login(self, page):
-        for _ in range(180):
-            if self.stop_requested:
-                raise RuntimeError("Đã dừng bởi người dùng")
-            url = page.url.lower()
-            if "login" not in url and ("onebss" in url or page.locator("text=Trang chủ").count()):
-                return
-            time.sleep(1)
-        raise RuntimeError("Hết thời gian chờ đăng nhập OneBSS")
 
     def _onebss_session_expired(self, page):
         if page.is_closed():
@@ -1345,7 +1336,24 @@ class ATSApp(tk.Tk):
             "target page, context or browser has been closed" in str(exc).lower()
         )
 
-    def _recover_closed_browser(self, playwright, context, cycle, recovery_attempt):
+    @staticmethod
+    def _browser_recovery_channels(failed_backends):
+        """Return untried browser backends in the safest platform order."""
+        if sys.platform == "win32":
+            candidates = ("chrome", "msedge", None)
+        elif sys.platform == "darwin":
+            candidates = ("chrome", None)
+        else:
+            candidates = (None,)
+        return tuple(
+            channel
+            for channel in candidates
+            if (channel or "playwright-chromium") not in failed_backends
+        )
+
+    def _recover_closed_browser(
+        self, playwright, context, cycle, recovery_attempt, failed_backends
+    ):
         """Replace a crashed/closed context and restore the OneBSS workspace."""
         self.current_stage = f"Chu kỳ {cycle}: phục hồi Chromium sau khi bị đóng"
         self.write_log(
@@ -1358,11 +1366,15 @@ class ATSApp(tk.Tk):
         except Exception:
             pass
 
-        # A repeated failure at Export can be specific to the bundled Chromium.
-        # On Windows, try the locally installed Chrome, then Edge, before
-        # falling back to Playwright Chromium. All candidates reuse the same
-        # automation profile so an active OneBSS session is retained.
-        channels = ("chrome", "msedge", None) if sys.platform == "win32" else (None,)
+        # Never retry a backend that crashed in this Export. On Windows the
+        # rotation is Chromium → Chrome → Edge; this makes a long-running
+        # session recover even if the first fallback later crashes too.
+        channels = self._browser_recovery_channels(failed_backends)
+        if not channels:
+            raise RuntimeError(
+                "Các trình duyệt khả dụng đều đã bị đóng khi xuất Excel. "
+                "Hãy mở lại ứng dụng để tạo phiên OneBSS mới."
+            )
         last_error = None
         for channel in channels:
             backend = channel or "playwright-chromium"
@@ -1400,6 +1412,7 @@ class ATSApp(tk.Tk):
     def _export_excel_with_recovery(self, playwright, context, page, cycle):
         """Export once, then recover from an absent download or closed browser."""
         recovery_attempt = 0
+        failed_backends = set()
         while True:
             self.current_stage = f"Chu kỳ {cycle}: cập nhật ngày và bộ lọc"
             self._refresh_cycle_dates(page)
@@ -1418,8 +1431,13 @@ class ATSApp(tk.Tk):
                     raise
                 recovery_attempt += 1
                 if recover_browser:
+                    failed_backends.add(self.browser_backend)
                     context, page = self._recover_closed_browser(
-                        playwright, context, cycle, recovery_attempt
+                        playwright,
+                        context,
+                        cycle,
+                        recovery_attempt,
+                        failed_backends,
                     )
                 else:
                     self._recover_onebss_after_download_timeout(
