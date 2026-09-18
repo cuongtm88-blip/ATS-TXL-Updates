@@ -1267,6 +1267,17 @@ class ATSApp(tk.Tk):
                 cycle = 1
                 while not self.stop_requested:
                     self.current_stage = f"Chu kỳ {cycle}: kiểm tra phiên OneBSS"
+                    # A browser can disappear while the application is sleeping
+                    # between automatic cycles.  Previously this check raised
+                    # immediately, while recovery only existed around Export.
+                    # Recover the persistent browser first; an expired OneBSS
+                    # session still remains a separate, explicit login event.
+                    if page.is_closed():
+                        failed_backends = {self.browser_backend}
+                        ctx, page = self._recover_closed_browser(
+                            p, ctx, cycle, 1, failed_backends
+                        )
+                        self.browser_context, self.browser_page = ctx, page
                     self._ensure_onebss_session_active(page)
                     if cycle > 1:
                         self.write_log(f"Bắt đầu chu kỳ tự động lần {cycle}.")

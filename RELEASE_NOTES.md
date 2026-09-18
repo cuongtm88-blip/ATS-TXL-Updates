@@ -1,3 +1,8 @@
+## Nội dung cập nhật 1.1.1
+
+- Sửa lỗi browser bị đóng trong thời gian chờ giữa hai chu kỳ tự động: trước khi bắt đầu chu kỳ mới, ứng dụng phát hiện page đã đóng, tự mở lại OneBSS, áp dụng lại bộ lọc và tiếp tục xuất Excel. Không còn dừng ngay với lỗi `Target page, context or browser has been closed` ở nhánh này.
+- Phiên OneBSS hết hạn vẫn được báo riêng để người dùng đăng nhập/OTP lại; ứng dụng không tự vượt qua bước xác thực.
+
 ## Nội dung cập nhật 1.1.0
 
 - Chuyển bản Windows sang bộ cài Inno Setup và cấu trúc PyInstaller `onedir`: runtime Python, Playwright và Chromium được đặt cố định trong thư mục ứng dụng thay vì giải nén vào thư mục tạm mỗi lần chạy.
