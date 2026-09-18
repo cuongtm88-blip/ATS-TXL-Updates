@@ -56,11 +56,11 @@ chuyển sang chu kỳ tiếp theo.
 
 ### Giữ máy thức khi chạy
 
-Chọn `Giữ máy thức khi chạy` trước hoặc trong khi đã mở OneBSS để tránh việc máy
-tự Sleep trong lúc chờ chu kỳ tự động. Trên macOS, ứng dụng gọi `caffeinate -ims`;
-trên Windows, ứng dụng dùng yêu cầu ngăn Sleep gốc của hệ điều hành. Chế độ này
-được lưu theo từng máy, hoạt động từ khi bấm `1. Mở Chrome / OneBSS` đến khi bấm
-`Dừng`, phiên làm việc kết thúc hoặc đóng ứng dụng. Chế độ này không ngăn đăng
+Chọn `Giữ máy thức khi chạy` để tránh việc máy tự Sleep trong lúc chờ chu kỳ tự
+động. Trên macOS, ứng dụng gọi `caffeinate -ims`; trên Windows, ứng dụng dùng yêu
+cầu ngăn Sleep gốc của hệ điều hành. Chế độ này được lưu theo từng máy, hoạt động
+từ khi bấm bước `2. Cấu hình & chạy` đến khi bấm `Dừng`, phiên làm việc kết thúc
+hoặc đóng ứng dụng. Chế độ này không ngăn đăng
 xuất, tắt máy, khởi động lại hay Sleep do đóng nắp laptop.
 
 ## Đóng gói Windows
@@ -73,33 +73,32 @@ File build sẽ:
 - Tự tạo môi trường, cài thư viện, Chromium tương thích và PyInstaller.
 - Đóng gói mã MonitorTXL cùng Chromium vào ứng dụng.
 
-Kết quả cài lần đầu trên máy đích là `dist\ATS-TXL.exe`. Máy đích không cần
-Python, Chrome, extension hay `MonitorTXL-1.exe`. Do chứa Chromium nên file EXE
-sẽ có kích thước lớn và lần mở đầu có thể chậm hơn.
+Kết quả là `dist\ATS-TXL-Setup.exe`. Chạy bộ cài này trên máy đích; ứng dụng sẽ
+được cài cố định vào `Program Files\ATS TXL`. Máy đích không cần Python, Chrome,
+extension hay `MonitorTXL-1.exe`. Python runtime, Playwright và Chromium được
+đặt trong thư mục ứng dụng thay vì giải nén vào thư mục tạm mỗi lần chạy.
 
 ## Tự cập nhật Windows qua GitHub Releases
 
 Kênh cập nhật công khai của ứng dụng là:
 <https://github.com/cuongtm88-blip/ATS-TXL-Updates/releases>
 
-Bản `ATS-TXL.exe` trên Windows tự kiểm tra cập nhật sau khi mở và kiểm tra lại
-mỗi 6 giờ. Người dùng cũng có thể bấm `Kiểm tra cập nhật` trên giao diện. Khi có
-phiên bản mới, ứng dụng sẽ hỏi xác nhận, tải toàn bộ EXE mới, kiểm tra SHA-256,
-đóng ứng dụng, thay EXE và tự mở lại. Không cần gỡ hoặc cài lại chương trình.
+Bản đã cài trên Windows tự kiểm tra cập nhật sau khi mở và kiểm tra lại mỗi 6 giờ.
+Người dùng cũng có thể bấm `Kiểm tra cập nhật` trên giao diện. Khi có phiên bản
+mới, ứng dụng tải bộ cài, kiểm tra SHA-256, rồi mở bộ cài để cập nhật đè an toàn.
 
 Token Telegram, Chat ID, chu kỳ lặp và danh sách người nhận cảnh báo được lưu
-trong thư mục dữ liệu riêng của người dùng, không nằm trong EXE. Vì vậy việc
-thay EXE không làm mất cấu hình. Nên đặt `ATS-TXL.exe` trong một thư mục mà tài
-khoản Windows có quyền ghi, ví dụ `Documents\ATS-TXL`; không đặt trong
-`Program Files`.
+trong thư mục dữ liệu riêng của người dùng, không nằm trong thư mục cài đặt. Vì
+vậy việc cập nhật không làm mất cấu hình. GitHub token chẩn đoán được lưu trong
+Windows Credential Manager, không ghi vào `settings.json`.
 
 Mỗi lần phát hành bản mới trên máy Windows dùng để build:
 
 1. Sửa mã nguồn cần thiết ở thư mục `ATS-TXL-Windows`.
 2. Tăng `APP_VERSION` trong `version.py`, ví dụ `1.0.0` thành `1.0.1`.
 3. Sửa `RELEASE_NOTES.md` để mô tả thay đổi.
-4. Chạy `build_windows.bat`. Script tạo `dist\ATS-TXL.exe` và
-   `dist\ATS-TXL.exe.sha256`.
+4. Chạy `build_windows.bat`. Script tạo `dist\ATS-TXL-Setup.exe` và
+   `dist\ATS-TXL-Setup.exe.sha256`.
 5. Chạy `publish_windows_release.bat`, nhập `PHAT HANH` khi được hỏi. Lần đầu,
    script tự cài GitHub CLI nếu cần và mở trình duyệt để đăng nhập GitHub.
 
@@ -112,7 +111,7 @@ phát hành cần tăng `APP_VERSION` để máy cài đặt nhận ra bản m�
 Repository công khai hiện cũng chứa mã nguồn ATS TXL và workflow Windows. Không
 cần máy Windows để phát hành: sau khi đẩy thay đổi và tăng `APP_VERSION`, vào
 tab **Actions** trên GitHub, chọn **Build and release Windows**, bấm **Run
-workflow**. GitHub sẽ tạo `ATS-TXL.exe`, SHA-256 và GitHub Release tương ứng.
+workflow**. GitHub sẽ tạo `ATS-TXL-Setup.exe`, SHA-256 và GitHub Release tương ứng.
 Workflow chỉ phát hành các tài sản EXE/SHA-256; các tệp cấu hình cục bộ, token,
 Chat ID, báo cáo Excel và Chrome profile bị loại trừ qua `.gitignore`.
 

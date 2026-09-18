@@ -34,34 +34,42 @@ jobs:
         shell: pwsh
         run: python app.py --self-test
 
-      - name: Build ATS-TXL.exe
+      - name: Build ATS-TXL onedir application
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all playwright --name ATS-TXL app.py
-          if (!(Test-Path "dist/ATS-TXL.exe")) { throw "PyInstaller did not create ATS-TXL.exe" }
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --collect-all playwright --collect-all keyring --name ATS-TXL app.py
+          if (!(Test-Path "dist/ATS-TXL/ATS-TXL.exe")) { throw "PyInstaller did not create the onedir ATS-TXL.exe" }
 
-      - name: Smoke-test frozen EXE
+      - name: Smoke-test frozen onedir application
         shell: pwsh
         run: |
-          & ".\\dist\\ATS-TXL.exe" --self-test
+          & ".\\dist\\ATS-TXL\\ATS-TXL.exe" --self-test
           $windowedExit = $LASTEXITCODE
           # A Windows GUI-subsystem application does not always populate
           # $LASTEXITCODE in PowerShell. Treat only an explicit non-zero
           # value as a failed startup.
           if (($null -ne $windowedExit) -and ($windowedExit -ne 0)) {
             Write-Host "Windowed EXE failed; building a console diagnostic copy..."
-            python -m PyInstaller --noconfirm --clean --onefile --console --collect-all playwright --name ATS-TXL-diagnostic app.py
-            & ".\\dist\\ATS-TXL-diagnostic.exe" --self-test
-            throw "Frozen ATS-TXL.exe could not start (windowed exit code: $windowedExit)"
+            python -m PyInstaller --noconfirm --clean --onedir --console --collect-all playwright --collect-all keyring --name ATS-TXL-diagnostic app.py
+            & ".\\dist\\ATS-TXL-diagnostic\\ATS-TXL-diagnostic.exe" --self-test
+            throw "Frozen onedir ATS-TXL.exe could not start (windowed exit code: $windowedExit)"
           }
 
-      - name: Create SHA-256 and read version
+      - name: Install Inno Setup and create installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress --yes
+          $version = (python -c "from version import APP_VERSION; print(APP_VERSION)").Trim()
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" "installer\ATS-TXL.iss"
+          if (!(Test-Path "dist/ATS-TXL-Setup.exe")) { throw "Inno Setup did not create ATS-TXL-Setup.exe" }
+
+      - name: Create installer SHA-256 and read version
         id: version
         shell: pwsh
         run: |
           $version = (python -c "from version import APP_VERSION; print(APP_VERSION)").Trim()
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist/ATS-TXL.exe").Hash.ToLower()
-          Set-Content -LiteralPath "dist/ATS-TXL.exe.sha256" -Value "$hash  ATS-TXL.exe" -Encoding ascii
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist/ATS-TXL-Setup.exe").Hash.ToLower()
+          Set-Content -LiteralPath "dist/ATS-TXL-Setup.exe.sha256" -Value "$hash  ATS-TXL-Setup.exe" -Encoding ascii
           "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Save build artifact
@@ -69,8 +77,8 @@ jobs:
         with:
           name: ATS-TXL-${{ steps.version.outputs.version }}-windows
           path: |
-            dist/ATS-TXL.exe
-            dist/ATS-TXL.exe.sha256
+            dist/ATS-TXL-Setup.exe
+            dist/ATS-TXL-Setup.exe.sha256
           if-no-files-found: error
 
       - name: Create or update GitHub Release
@@ -82,7 +90,7 @@ jobs:
           $tag = "v$env:VERSION"
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag "dist/ATS-TXL.exe#ATS-TXL.exe" "dist/ATS-TXL.exe.sha256#ATS-TXL.exe.sha256" --clobber --repo $env:GITHUB_REPOSITORY
+            gh release upload $tag "dist/ATS-TXL-Setup.exe#ATS-TXL-Setup.exe" "dist/ATS-TXL-Setup.exe.sha256#ATS-TXL-Setup.exe.sha256" --clobber --repo $env:GITHUB_REPOSITORY
           } else {
-            gh release create $tag "dist/ATS-TXL.exe#ATS-TXL.exe" "dist/ATS-TXL.exe.sha256#ATS-TXL.exe.sha256" --repo $env:GITHUB_REPOSITORY --title "ATS TXL v$env:VERSION" --notes-file RELEASE_NOTES.md --latest
+            gh release create $tag "dist/ATS-TXL-Setup.exe#ATS-TXL-Setup.exe" "dist/ATS-TXL-Setup.exe.sha256#ATS-TXL-Setup.exe.sha256" --repo $env:GITHUB_REPOSITORY --title "ATS TXL v$env:VERSION" --notes-file RELEASE_NOTES.md --latest
           }

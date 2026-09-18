@@ -19,6 +19,11 @@ from tkinter import messagebox, ttk
 import requests
 
 try:
+    import keyring
+except ImportError:  # Source-only fallback; release builds include keyring.
+    keyring = None
+
+try:
     from playwright._impl._errors import TargetClosedError
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     from playwright.sync_api import sync_playwright
@@ -28,6 +33,7 @@ except ImportError:  # pragma: no cover - friendly message at runtime
     TargetClosedError = RuntimeError
 
 import TXL_Monitor_Tele_Group_All_Over10 as txl
+import diagnostics_upload
 import updater
 from version import APP_VERSION, UPDATE_CHECK_INTERVAL_SECONDS
 
@@ -62,6 +68,9 @@ INCIDENT_INVENTORY_URL = ONEBSS_URL + "#/htkh/ManagementIncidentInventory?tag=2"
 # attempts to rotate through the available Windows backends once.
 MAX_EXCEL_RECOVERY_ATTEMPTS = 3
 DIAGNOSTICS_DIRNAME = "diagnostics"
+DIAGNOSTICS_SECRET_SERVICE = "ATS-TXL"
+DIAGNOSTICS_SECRET_NAME = "github-diagnostics-token"
+DEFAULT_DIAGNOSTICS_REPOSITORY = "cuongtm88-blip/ATS-TXL-Diagnostics"
 
 
 def _load_settings():
@@ -84,6 +93,24 @@ def _save_settings(data):
     except OSError:
         pass
     os.replace(temporary, SETTINGS_PATH)
+
+
+def _load_diagnostics_token():
+    if keyring is None:
+        return ""
+    try:
+        return keyring.get_password(DIAGNOSTICS_SECRET_SERVICE, DIAGNOSTICS_SECRET_NAME) or ""
+    except Exception:
+        return ""
+
+
+def _save_diagnostics_token(token):
+    if keyring is None:
+        raise RuntimeError("Thiếu thư viện keyring để lưu GitHub token an toàn")
+    try:
+        keyring.set_password(DIAGNOSTICS_SECRET_SERVICE, DIAGNOSTICS_SECRET_NAME, token)
+    except Exception as exc:
+        raise RuntimeError(f"Không thể lưu GitHub token vào kho bảo mật hệ điều hành: {exc}") from exc
     try:
         SETTINGS_PATH.chmod(0o600)
     except OSError:
@@ -120,8 +147,8 @@ class ATSApp(tk.Tk):
         super().__init__()
         saved = _load_settings()
         self.title("ATS TXL - OneBSS → Telegram")
-        self.geometry("900x650")
-        self.minsize(820, 550)
+        self.geometry("980x760")
+        self.minsize(900, 650)
         self.worker = None
         self.stop_requested = False
         self.auto_repeat = bool(saved.get("schedule_enabled", True))
@@ -143,6 +170,21 @@ class ATSApp(tk.Tk):
         self.error_recipient_chat_ids = tk.StringVar(value=", ".join(saved_recipients))
         self._error_recipient_ids = saved_recipients
         self._telegram_token_for_alerts = self.telegram_token.get().strip()
+        self.github_diagnostics_enabled = tk.BooleanVar(
+            value=bool(saved.get("github_diagnostics_enabled", False))
+        )
+        self.github_diagnostics_repository = tk.StringVar(
+            value=saved.get("github_diagnostics_repository", DEFAULT_DIAGNOSTICS_REPOSITORY)
+        )
+        self.github_diagnostics_token = tk.StringVar(value=_load_diagnostics_token())
+        self.github_include_screenshot = tk.BooleanVar(
+            value=bool(saved.get("github_include_screenshot", False))
+        )
+        self.github_include_trace = tk.BooleanVar(
+            value=bool(saved.get("github_include_trace", False))
+        )
+        self.diagnostics_machine_id = str(saved.get("diagnostics_machine_id") or uuid.uuid4())
+        self._diagnostics_upload_config = None
         self.current_stage = "Khởi tạo ứng dụng"
         self.browser_context = None
         self.browser_page = None
@@ -155,6 +197,11 @@ class ATSApp(tk.Tk):
         self.update_in_progress = False
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        try:
+            self._apply_diagnostics_config()
+        except Exception as exc:
+            self.write_log(f"Chẩn đoán GitHub chưa sẵn sàng: {exc}")
+        self.after(5000, self._retry_pending_diagnostics)
         if updater.can_self_update():
             self.after(2500, self._automatic_update_tick)
 
@@ -207,6 +254,47 @@ class ATSApp(tk.Tk):
         ).grid(row=4, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
         box.columnconfigure(1, weight=1)
         box.columnconfigure(2, weight=1)
+
+        diagnostics_box = ttk.LabelFrame(self, text="Chẩn đoán GitHub private (tùy chọn)")
+        diagnostics_box.pack(fill="x", **pad)
+        ttk.Checkbutton(
+            diagnostics_box,
+            text="Tự gửi gói chẩn đoán khi có lỗi",
+            variable=self.github_diagnostics_enabled,
+        ).grid(row=0, column=0, sticky="w", **pad)
+        ttk.Label(diagnostics_box, text="Repository").grid(row=0, column=1, sticky="w", **pad)
+        ttk.Entry(
+            diagnostics_box,
+            textvariable=self.github_diagnostics_repository,
+            width=34,
+        ).grid(row=0, column=2, sticky="ew", **pad)
+        ttk.Label(diagnostics_box, text="GitHub token").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Entry(
+            diagnostics_box,
+            textvariable=self.github_diagnostics_token,
+            show="*",
+            width=34,
+        ).grid(row=1, column=1, columnspan=2, sticky="ew", **pad)
+        ttk.Button(
+            diagnostics_box,
+            text="Kiểm tra & gửi thử",
+            command=self._test_diagnostics_upload,
+        ).grid(row=1, column=3, sticky="ew", **pad)
+        ttk.Checkbutton(
+            diagnostics_box,
+            text="Kèm ảnh màn hình lỗi",
+            variable=self.github_include_screenshot,
+        ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 4))
+        ttk.Checkbutton(
+            diagnostics_box,
+            text="Kèm Playwright trace (có thể chứa dữ liệu OneBSS)",
+            variable=self.github_include_trace,
+        ).grid(row=2, column=1, columnspan=2, sticky="w", padx=12, pady=(0, 4))
+        ttk.Label(
+            diagnostics_box,
+            text="Token chỉ lưu trong Windows Credential Manager/Keychain; không ghi vào settings.json hay GitHub public.",
+        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
+        diagnostics_box.columnconfigure(2, weight=1)
 
         actions = ttk.Frame(self)
         actions.pack(fill="x", **pad)
@@ -268,7 +356,7 @@ class ATSApp(tk.Tk):
             settings = _load_settings()
             settings["keep_awake_enabled"] = enabled
             _save_settings(settings)
-        except OSError as exc:
+        except (OSError, RuntimeError, diagnostics_upload.DiagnosticUploadError) as exc:
             self.write_log(f"Không lưu được lựa chọn giữ máy thức: {exc}")
 
         if self.worker and self.worker.is_alive():
@@ -485,17 +573,17 @@ class ATSApp(tk.Tk):
     def _install_downloaded_update(self, info, target):
         self.progress.stop()
         try:
-            updater.launch_windows_replacement(target, APP_DATA / "updates")
+            updater.launch_windows_installer(target)
         except Exception as exc:
             self._finish_update_download_error(str(exc))
             return
         self.write_log(
-            f"Đã xác minh ATS TXL {info.version}; ứng dụng sẽ tự khởi động lại."
+            f"Đã xác minh bộ cài ATS TXL {info.version}; đang mở bộ cài để cập nhật."
         )
         messagebox.showinfo(
             "Cập nhật ATS TXL",
             f"Đã tải và xác minh phiên bản {info.version}.\n"
-            "Ứng dụng sẽ đóng và tự mở lại bằng phiên bản mới.",
+            "Bộ cài sẽ đóng ứng dụng, cập nhật và mở lại phiên bản mới.",
         )
         self.destroy()
 
@@ -564,7 +652,8 @@ class ATSApp(tk.Tk):
         os.environ["TXL_TELEGRAM_BOT_TOKEN"] = token
         os.environ["TXL_TELEGRAM_GROUP_CHAT_ID"] = chat_id
         try:
-            _save_settings({
+            settings = _load_settings()
+            settings.update({
                 "telegram_token": token,
                 "telegram_chat_id": chat_id,
                 "error_recipient_chat_ids": error_recipient_ids,
@@ -572,6 +661,8 @@ class ATSApp(tk.Tk):
                 "repeat_minutes": interval_minutes,
                 "keep_awake_enabled": bool(self.keep_awake_enabled.get()),
             })
+            self._apply_diagnostics_config(settings)
+            _save_settings(settings)
         except OSError as exc:
             messagebox.showerror(
                 "Không lưu được cấu hình",
@@ -583,6 +674,75 @@ class ATSApp(tk.Tk):
             f"có {len(error_recipient_ids)} người nhận cảnh báo lỗi."
         )
         return True
+
+    def _apply_diagnostics_config(self, settings=None):
+        """Persist non-secret diagnostics settings and snapshot upload options."""
+        enabled = bool(self.github_diagnostics_enabled.get())
+        repository = self.github_diagnostics_repository.get().strip()
+        token = self.github_diagnostics_token.get().strip() or _load_diagnostics_token()
+        if enabled:
+            repository = diagnostics_upload.validate_repository(repository)
+            if not token:
+                raise OSError(
+                    "Đã bật gửi chẩn đoán GitHub nhưng chưa có GitHub token. "
+                    "Nhập token rồi bấm bước 2 hoặc Kiểm tra & gửi thử."
+                )
+            if self.github_diagnostics_token.get().strip():
+                _save_diagnostics_token(token)
+        if settings is None:
+            settings = _load_settings()
+        settings.update({
+            "github_diagnostics_enabled": enabled,
+            "github_diagnostics_repository": repository,
+            "github_include_screenshot": bool(self.github_include_screenshot.get()),
+            "github_include_trace": bool(self.github_include_trace.get()),
+            "diagnostics_machine_id": self.diagnostics_machine_id,
+        })
+        self._diagnostics_upload_config = (
+            {
+                "repository": repository,
+                "token": token,
+                "include_screenshot": bool(self.github_include_screenshot.get()),
+                "include_trace": bool(self.github_include_trace.get()),
+                "machine_id": self.diagnostics_machine_id,
+            }
+            if enabled else None
+        )
+        return settings
+
+    def _test_diagnostics_upload(self):
+        try:
+            settings = self._apply_diagnostics_config()
+            _save_settings(settings)
+        except Exception as exc:
+            messagebox.showerror("Chẩn đoán GitHub", str(exc))
+            return
+        config = self._diagnostics_upload_config
+        if not config:
+            messagebox.showwarning(
+                "Chẩn đoán GitHub",
+                "Hãy bật “Tự gửi gói chẩn đoán khi có lỗi” trước khi kiểm tra.",
+            )
+            return
+        self.write_log("Đang kiểm tra quyền gửi chẩn đoán lên GitHub private...")
+        threading.Thread(
+            target=self._test_diagnostics_upload_worker,
+            args=(config,),
+            daemon=True,
+        ).start()
+
+    def _test_diagnostics_upload_worker(self, config):
+        try:
+            result = diagnostics_upload.upload_connection_test(
+                config["repository"], config["token"], config["machine_id"]
+            )
+            text = f"Đã gửi kiểm tra GitHub thành công: {result['remote_path']}"
+            self.write_log(text)
+            self.after(0, lambda: messagebox.showinfo("Chẩn đoán GitHub", text))
+        except Exception as exc:
+            text = f"Kiểm tra gửi chẩn đoán thất bại: {exc}"
+            self.write_log(text)
+            self.after(0, lambda: messagebox.showerror("Chẩn đoán GitHub", text))
 
     def _send_private_message(self, message):
         """Best-effort delivery to every configured private error recipient."""
@@ -897,6 +1057,7 @@ class ATSApp(tk.Tk):
             "page_url": self._safe_page_url(page),
             "events": [],
             "trace_started": False,
+            "browser_processes_before": self._windows_browser_processes(),
         }
         self._attach_context_diagnostics(context, page)
         try:
@@ -936,6 +1097,66 @@ class ATSApp(tk.Tk):
         except Exception as exc:
             return f"Không đọc được Windows Event Log: {exc}"
 
+    @staticmethod
+    def _windows_browser_processes():
+        """Snapshot browser processes around an Export without collecting command lines."""
+        if sys.platform != "win32":
+            return "Không áp dụng: không phải Windows."
+        command = (
+            "Get-Process chrome,msedge,chromium -ErrorAction SilentlyContinue | "
+            "Select-Object Id,ProcessName,Path,StartTime,CPU,WorkingSet64 | "
+            "ConvertTo-Json -Depth 3"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            return result.stdout.strip() or result.stderr.strip() or "Không có browser process phù hợp."
+        except Exception as exc:
+            return f"Không đọc được browser process: {exc}"
+
+    def _queue_diagnostic_upload(self, folder):
+        config = self._diagnostics_upload_config
+        if not config:
+            return
+        threading.Thread(
+            target=self._diagnostic_upload_worker,
+            args=(Path(folder), dict(config)),
+            daemon=True,
+        ).start()
+
+    def _diagnostic_upload_worker(self, folder, config):
+        try:
+            receipt = diagnostics_upload.upload_folder(folder, **config)
+            self.write_log(
+                f"Đã gửi gói chẩn đoán GitHub private: {receipt['remote_path']}"
+            )
+        except Exception as exc:
+            try:
+                (folder / "github-upload-error.txt").write_text(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} {exc}\n", encoding="utf-8"
+                )
+            except OSError:
+                pass
+            self.write_log(f"Chưa gửi được gói chẩn đoán GitHub: {exc}")
+
+    def _retry_pending_diagnostics(self):
+        config = self._diagnostics_upload_config
+        root = APP_DATA / DIAGNOSTICS_DIRNAME
+        if not config or not root.is_dir():
+            return
+        pending = [
+            folder for folder in sorted(root.iterdir())
+            if folder.is_dir() and (folder / "summary.json").is_file()
+            and not (folder / "github-upload.json").is_file()
+        ][:3]
+        for folder in pending:
+            self._queue_diagnostic_upload(folder)
+
     def _finish_export_diagnostic(self, context, page, exc=None):
         active = self._active_export_diagnostic
         if not active or active.get("context") is not context:
@@ -953,6 +1174,13 @@ class ATSApp(tk.Tk):
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         folder = APP_DATA / DIAGNOSTICS_DIRNAME / f"export_{timestamp}_{active['id']}"
         folder.mkdir(parents=True, exist_ok=True)
+        screenshot_path = folder / "onebss-error.png"
+        screenshot_error = ""
+        try:
+            if not page.is_closed():
+                page.screenshot(path=str(screenshot_path), full_page=True, timeout=10000)
+        except Exception as image_exc:
+            screenshot_error = str(image_exc)
         trace_path = folder / "playwright-trace.zip"
         trace_error = ""
         if active["trace_started"]:
@@ -971,6 +1199,8 @@ class ATSApp(tk.Tk):
             "page_url_after_error": self._safe_page_url(page),
             "trace_path": str(trace_path) if trace_path.exists() else "",
             "trace_error": trace_error,
+            "screenshot_path": str(screenshot_path) if screenshot_path.exists() else "",
+            "screenshot_error": screenshot_error,
         }
         (folder / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -981,8 +1211,20 @@ class ATSApp(tk.Tk):
         (folder / "windows-events.json").write_text(
             self._windows_crash_events(), encoding="utf-8"
         )
+        (folder / "browser-processes.json").write_text(
+            json.dumps(
+                {
+                    "before_export": active.get("browser_processes_before", ""),
+                    "after_error": self._windows_browser_processes(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         self._last_diagnostic_path = folder
         self.write_log(f"Đã lưu gói chẩn đoán Export: {folder}")
+        self._queue_diagnostic_upload(folder)
         return folder
 
     def _session_workflow(self):

@@ -73,28 +73,55 @@ set "PLAYWRIGHT_BROWSERS_PATH=0"
 echo Dang cai Chromium tuong thich voi Playwright...
 python -m playwright install chromium
 if errorlevel 1 goto :failed
-echo Dang dong goi ATS-TXL.exe (file co the lon vi kem ca Chromium)...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all playwright --name ATS-TXL app.py
+echo Dang dong goi ATS-TXL theo thu muc co dinh (onedir, kem Chromium)...
+python -m PyInstaller --noconfirm --clean --onedir --windowed --collect-all playwright --collect-all keyring --name ATS-TXL app.py
 if errorlevel 1 goto :failed
 
-if not exist "dist\ATS-TXL.exe" (
-    echo [LOI] PyInstaller khong tao ra dist\ATS-TXL.exe
+if not exist "dist\ATS-TXL\ATS-TXL.exe" (
+    echo [LOI] PyInstaller khong tao ra dist\ATS-TXL\ATS-TXL.exe
+    goto :failed
+)
+
+where ISCC.exe >nul 2>nul
+if errorlevel 1 (
+    echo Dang cai Inno Setup...
+    where winget >nul 2>nul
+    if errorlevel 1 (
+        echo [LOI] Can cai Inno Setup 6 de tao bo cai.
+        goto :failed
+    )
+    winget install --id JRSoftware.InnoSetup --exact --accept-package-agreements --accept-source-agreements
+    if errorlevel 1 goto :failed
+)
+for /f "delims=" %%V in ('python -c "from version import APP_VERSION; print(APP_VERSION)"') do set "APP_VERSION=%%V"
+where ISCC.exe >nul 2>nul
+if errorlevel 1 (
+    set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+) else (
+    set "ISCC=ISCC.exe"
+)
+echo Dang tao bo cai Inno Setup...
+"%ISCC%" /DMyAppVersion=%APP_VERSION% installer\ATS-TXL.iss
+if errorlevel 1 goto :failed
+
+if not exist "dist\ATS-TXL-Setup.exe" (
+    echo [LOI] Inno Setup khong tao ra dist\ATS-TXL-Setup.exe
     goto :failed
 )
 
 echo Dang tao ma kiem tra SHA-256...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$hash=(Get-FileHash -Algorithm SHA256 -LiteralPath 'dist\ATS-TXL.exe').Hash.ToLower(); Set-Content -LiteralPath 'dist\ATS-TXL.exe.sha256' -Value ($hash + '  ATS-TXL.exe') -Encoding ascii"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$hash=(Get-FileHash -Algorithm SHA256 -LiteralPath 'dist\ATS-TXL-Setup.exe').Hash.ToLower(); Set-Content -LiteralPath 'dist\ATS-TXL-Setup.exe.sha256' -Value ($hash + '  ATS-TXL-Setup.exe') -Encoding ascii"
 if errorlevel 1 goto :failed
-if not exist "dist\ATS-TXL.exe.sha256" (
+if not exist "dist\ATS-TXL-Setup.exe.sha256" (
     echo [LOI] Khong tao duoc dist\ATS-TXL.exe.sha256
     goto :failed
 )
 
 echo.
 echo [THANH CONG] Cac file da tao cho phien ban %APP_VERSION%:
-echo %CD%\dist\ATS-TXL.exe
-echo %CD%\dist\ATS-TXL.exe.sha256
-echo Chi can chep file ATS-TXL.exe sang may Windows dich lan dau.
+echo %CD%\dist\ATS-TXL-Setup.exe
+echo %CD%\dist\ATS-TXL-Setup.exe.sha256
+echo Chay ATS-TXL-Setup.exe tren may Windows dich de cai dat.
 echo De phat hanh cap nhat, chay publish_windows_release.bat.
 echo Khong can MonitorTXL-1.exe, Python, Chrome hay extension rieng.
 echo.

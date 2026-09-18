@@ -109,11 +109,11 @@ def calculate_sha256(path):
 
 
 def download_update(info, destination_dir, session=requests, progress=None):
-    """Download an EXE and verify it against its published SHA-256 asset."""
+    """Download the signed-by-hash release installer and verify it."""
     destination_dir = Path(destination_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
     partial = destination_dir / f"{UPDATE_ASSET_NAME}.{info.version}.part"
-    downloaded = destination_dir / f"ATS-TXL-{info.version}.exe"
+    downloaded = destination_dir / f"ATS-TXL-Setup-{info.version}.exe"
 
     try:
         response = session.get(
@@ -252,3 +252,18 @@ def launch_windows_replacement(new_exe, work_dir):
         creationflags=creationflags,
     )
     return script_path
+
+
+def launch_windows_installer(installer_path):
+    """Start the Inno Setup installer; it owns replacement of the onedir app."""
+    if not can_self_update():
+        raise UpdateError("Tự cập nhật chỉ hoạt động trong bản đóng gói Windows")
+    installer_path = Path(installer_path).resolve()
+    if not installer_path.is_file():
+        raise UpdateError("Không tìm thấy bộ cài cập nhật đã tải xuống")
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.Popen(
+        [str(installer_path), "/SP-", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
+        close_fds=True,
+        creationflags=creationflags,
+    )
