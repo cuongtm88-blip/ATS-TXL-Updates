@@ -1266,19 +1266,6 @@ class ATSApp(tk.Tk):
                 self.after(0, lambda: self.progress.start(10))
                 cycle = 1
                 while not self.stop_requested:
-                    self.current_stage = f"Chu kỳ {cycle}: kiểm tra phiên OneBSS"
-                    # A browser can disappear while the application is sleeping
-                    # between automatic cycles.  Previously this check raised
-                    # immediately, while recovery only existed around Export.
-                    # Recover the persistent browser first; an expired OneBSS
-                    # session still remains a separate, explicit login event.
-                    if page.is_closed():
-                        failed_backends = {self.browser_backend}
-                        ctx, page = self._recover_closed_browser(
-                            p, ctx, cycle, 1, failed_backends
-                        )
-                        self.browser_context, self.browser_page = ctx, page
-                    self._ensure_onebss_session_active(page)
                     if cycle > 1:
                         self.write_log(f"Bắt đầu chu kỳ tự động lần {cycle}.")
                     ctx, page, excel = self._export_excel_with_recovery(
@@ -1610,7 +1597,7 @@ class ATSApp(tk.Tk):
         """Replace a crashed/closed context and restore the OneBSS workspace."""
         self.current_stage = f"Chu kỳ {cycle}: phục hồi Chromium sau khi bị đóng"
         self.write_log(
-            "Chromium/OneBSS đã bị đóng khi xuất Excel. "
+            "Browser/OneBSS đã bị đóng trong chu kỳ. "
             f"Đang mở lại và cấu hình lại (lần {recovery_attempt}/"
             f"{MAX_EXCEL_RECOVERY_ATTEMPTS})..."
         )
@@ -1625,7 +1612,7 @@ class ATSApp(tk.Tk):
         channels = self._browser_recovery_channels(failed_backends)
         if not channels:
             raise RuntimeError(
-                "Các trình duyệt khả dụng đều đã bị đóng khi xuất Excel. "
+                "Các trình duyệt khả dụng đều đã bị đóng trong chu kỳ. "
                 "Hãy mở lại ứng dụng để tạo phiên OneBSS mới."
             )
         last_error = None
@@ -1663,14 +1650,19 @@ class ATSApp(tk.Tk):
         raise RuntimeError(f"Không thể khởi chạy lại OneBSS sau lỗi browser: {last_error}")
 
     def _export_excel_with_recovery(self, playwright, context, page, cycle):
-        """Export once, then recover from an absent download or closed browser."""
+        """Run a complete cycle and recover from a browser disappearing at any stage."""
         recovery_attempt = 0
         failed_backends = set()
         while True:
-            self.current_stage = f"Chu kỳ {cycle}: cập nhật ngày và bộ lọc"
-            self._refresh_cycle_dates(page)
-            self.current_stage = f"Chu kỳ {cycle}: tìm kiếm và xuất Excel"
             try:
+                # Browser shutdowns can race with the start of a scheduled
+                # cycle, including the date-filter update.  Keep every
+                # browser-touching operation inside this recovery boundary.
+                self.current_stage = f"Chu kỳ {cycle}: kiểm tra phiên OneBSS"
+                self._ensure_onebss_session_active(page)
+                self.current_stage = f"Chu kỳ {cycle}: cập nhật ngày và bộ lọc"
+                self._refresh_cycle_dates(page)
+                self.current_stage = f"Chu kỳ {cycle}: tìm kiếm và xuất Excel"
                 return context, page, self._export_excel(page, context)
             except Exception as exc:
                 recover_download = isinstance(exc, PlaywrightTimeoutError) and (

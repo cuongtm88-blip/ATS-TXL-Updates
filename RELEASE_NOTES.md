@@ -1,3 +1,8 @@
+## Nội dung cập nhật 1.1.2
+
+- Mở rộng phục hồi browser cho toàn bộ chu kỳ tự động. Nếu `Target page, context or browser has been closed` xảy ra khi kiểm tra phiên, cập nhật ngày/bộ lọc, tìm kiếm hoặc xuất Excel, ATS TXL tự luân phiên Chromium → Chrome → Edge, mở lại OneBSS, áp dụng lại bộ lọc và thử tiếp thay vì dừng ngay.
+- Sửa tình huống browser đóng đúng trong khoảng chờ giữa hai chu kỳ khiến bản 1.1.1 vẫn hiển thị hộp lỗi ở bước cập nhật ngày và bộ lọc.
+
 ## Nội dung cập nhật 1.1.1
 
 - Sửa lỗi browser bị đóng trong thời gian chờ giữa hai chu kỳ tự động: trước khi bắt đầu chu kỳ mới, ứng dụng phát hiện page đã đóng, tự mở lại OneBSS, áp dụng lại bộ lọc và tiếp tục xuất Excel. Không còn dừng ngay với lỗi `Target page, context or browser has been closed` ở nhánh này.
