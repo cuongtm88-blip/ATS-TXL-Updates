@@ -1,3 +1,11 @@
+## Nội dung cập nhật 1.1.3
+
+- Giữ Chromium tích hợp làm trình duyệt mặc định trên Windows; tạm dừng chuyển tự động sang Chrome/Edge. Khi trình duyệt bị đóng, ứng dụng chỉ thử mở lại cùng loại tối đa 3 lần và giữ nguyên bước đăng nhập/OTP nếu phiên đã hết hạn.
+- Tách hồ sơ Chromium, Chrome và Edge trên Windows, tránh dùng chung thư mục dữ liệu giữa các trình duyệt. Lần chạy đầu tiên sau cập nhật cần đăng nhập OneBSS/OTP lại một lần; hồ sơ cũ không bị xóa.
+- Phát hiện access token OneBSS đã hết hạn ngay cả khi giao diện vẫn hiện trang danh sách, không đợi 10 phút rồi báo sai là OneBSS đang xử lý. Không ghi token vào log hoặc gói chẩn đoán thông thường.
+- Ẩn cửa sổ PowerShell khi thu thập tiến trình và Windows Event Log cho chẩn đoán. Cửa sổ đen từng xuất hiện khi chẩn đoán không phải bằng chứng rằng Chrome/Edge bị crash.
+- Chưa thể khẳng định nguyên nhân khiến toàn bộ tiến trình trình duyệt bị Windows đóng; tiếp tục lưu sự kiện và chẩn đoán để đối chiếu sau bản vá.
+
 ## Nội dung cập nhật 1.1.2
 
 - Mở rộng phục hồi browser cho toàn bộ chu kỳ tự động. Nếu `Target page, context or browser has been closed` xảy ra khi kiểm tra phiên, cập nhật ngày/bộ lọc, tìm kiếm hoặc xuất Excel, ATS TXL tự luân phiên Chromium → Chrome → Edge, mở lại OneBSS, áp dụng lại bộ lọc và thử tiếp thay vì dừng ngay.

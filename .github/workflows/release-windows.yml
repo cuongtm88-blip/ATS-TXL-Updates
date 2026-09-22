@@ -32,7 +32,9 @@ jobs:
 
       - name: Smoke-test source imports
         shell: pwsh
-        run: python app.py --self-test
+        run: |
+          python -m unittest -v test_recovery
+          python app.py --self-test
 
       - name: Build ATS-TXL onedir application
         shell: pwsh

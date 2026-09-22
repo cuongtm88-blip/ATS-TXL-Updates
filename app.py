@@ -64,13 +64,17 @@ else:
     DOWNLOADS = ROOT / "downloads"
 ONEBSS_URL = "https://onebss.vnpt.vn/"
 INCIDENT_INVENTORY_URL = ONEBSS_URL + "#/htkh/ManagementIncidentInventory?tag=2"
-# A browser can crash again immediately after the first recovery.  Keep enough
-# attempts to rotate through the available Windows backends once.
+# A browser can close again after the first restart. Retry the same backend a
+# bounded number of times; never rotate Chromium/Chrome/Edge mid-session.
 MAX_EXCEL_RECOVERY_ATTEMPTS = 3
 DIAGNOSTICS_DIRNAME = "diagnostics"
 DIAGNOSTICS_SECRET_SERVICE = "ATS-TXL"
 DIAGNOSTICS_SECRET_NAME = "github-diagnostics-token"
 DEFAULT_DIAGNOSTICS_REPOSITORY = "cuongtm88-blip/ATS-TXL-Diagnostics"
+
+
+class OneBSSSessionExpiredError(RuntimeError):
+    """OneBSS needs a fresh interactive login, including OTP if requested."""
 
 
 def _load_settings():
@@ -287,7 +291,7 @@ class ATSApp(tk.Tk):
         ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 4))
         ttk.Checkbutton(
             diagnostics_box,
-            text="Kèm Playwright trace (có thể chứa dữ liệu OneBSS)",
+            text="Kèm Playwright trace (có thể chứa token và dữ liệu OneBSS)",
             variable=self.github_include_trace,
         ).grid(row=2, column=1, columnspan=2, sticky="w", padx=12, pady=(0, 4))
         ttk.Label(
@@ -595,7 +599,7 @@ class ATSApp(tk.Tk):
             messagebox.showerror("Thiếu thư viện", "Chạy: pip install -r requirements.txt && playwright install chromium")
             return
         if self.worker and self.worker.is_alive():
-            self.write_log("Chrome đã mở. Hãy đăng nhập rồi bấm nút 2.")
+            self.write_log("Trình duyệt OneBSS đã mở. Hãy đăng nhập rồi bấm nút 2.")
             return
         self.stop_requested = False
         self.start_event = threading.Event()
@@ -616,7 +620,7 @@ class ATSApp(tk.Tk):
                 self.write_log("Đã nhận bước 2. Đang kiểm tra đăng nhập, cấu hình OneBSS và chạy quy trình...")
                 self.start_event.set()
             return
-        self.write_log("Hãy bấm nút 1 để mở Chrome trước.")
+        self.write_log("Hãy bấm nút 1 để mở OneBSS trước.")
 
     def _apply_telegram_config(self):
         token = self.telegram_token.get().strip()
@@ -964,11 +968,18 @@ class ATSApp(tk.Tk):
         active = self._active_export_diagnostic
         if not active or active.get("context") is not context:
             return
+        def redact(value):
+            value = str(value)
+            return re.sub(
+                r"(?i)(authorization\s*:\s*bearer\s+)([A-Za-z0-9._~-]+)",
+                r"\1[REDACTED]",
+                value,
+            )[:2000]
         active["events"].append(
             {
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "event": event_name,
-                **{key: str(value)[:2000] for key, value in details.items()},
+                **{key: redact(value) for key, value in details.items()},
             }
         )
 
@@ -1092,6 +1103,7 @@ class ATSApp(tk.Tk):
                 text=True,
                 timeout=20,
                 check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             return result.stdout.strip() or result.stderr.strip() or "Không có sự kiện phù hợp."
         except Exception as exc:
@@ -1114,6 +1126,7 @@ class ATSApp(tk.Tk):
                 text=True,
                 timeout=15,
                 check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             return result.stdout.strip() or result.stderr.strip() or "Không có browser process phù hợp."
         except Exception as exc:
@@ -1307,6 +1320,35 @@ class ATSApp(tk.Tk):
         url = page.url.lower()
         if any(marker in url for marker in ("login", "signin", "auth")):
             return True
+        # OneBSS can leave the inventory screen visible after its access JWT
+        # expires. Only return an expiry time: never copy the token into Python,
+        # a log, or a diagnostic upload.
+        try:
+            expires_at = page.evaluate("""() => {
+                const expiries = [];
+                for (const storage of [window.localStorage, window.sessionStorage]) {
+                    for (let i = 0; i < storage.length; i++) {
+                        const value = storage.getItem(storage.key(i)) || '';
+                        if (value.length > 200000) continue;
+                        for (const match of value.matchAll(/eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+/g)) {
+                            try {
+                                const payload = match[0].split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+                                const claims = JSON.parse(atob(payload));
+                                if (typeof claims.exp === 'number' && claims.client_id && claims.scope) {
+                                    expiries.push(claims.exp);
+                                }
+                            } catch (_) {}
+                        }
+                    }
+                }
+                return expiries.length ? Math.max(...expiries) : null;
+            }""")
+            if expires_at is not None and float(expires_at) <= time.time() + 30:
+                return True
+        except Exception:
+            # Login-page detection below remains available when storage is
+            # inaccessible (e.g. while navigation is in progress).
+            pass
         try:
             password = page.locator('input[type="password"]').first
             return password.count() > 0 and password.is_visible(timeout=300)
@@ -1319,8 +1361,10 @@ class ATSApp(tk.Tk):
                 "Trình duyệt OneBSS đã bị đóng. Hãy mở lại ứng dụng để tiếp tục."
             )
         if self._onebss_session_expired(page):
-            raise RuntimeError(
-                "Phiên đăng nhập OneBSS đã hết hạn. Hãy mở ứng dụng và đăng nhập lại OneBSS."
+            raise OneBSSSessionExpiredError(
+                "Phiên đăng nhập OneBSS đã hết hạn. Hãy đăng nhập và nhập OTP lại "
+                "ở bước 1, sau đó bấm bước 2. Chương trình không tự xuất Excel "
+                "khi phiên xác thực không còn hiệu lực."
             )
 
     def _launch_browser_context(
@@ -1332,25 +1376,27 @@ class ATSApp(tk.Tk):
         browser_channel=None,
         use_configured_channel=True,
     ):
-        """Launch the Playwright-matched browser instead of system Chrome.
-
-        The installed Google Chrome channel can be newer than the Playwright
-        driver and has crashed during OneBSS downloads on macOS. Playwright's
-        bundled Chromium is version-matched and is therefore the safe default.
-        Set ATS_BROWSER_CHANNEL=chrome only when explicitly needed.
-        """
+        """Use Playwright's version-matched Chromium unless explicitly overridden."""
         options = {
             "headless": headless,
             "accept_downloads": True,
             "viewport": {"width": 1440, "height": 900},
         }
-        Path(profile).mkdir(parents=True, exist_ok=True)
         if browser_channel is None and use_configured_channel:
             browser_channel = os.getenv("ATS_BROWSER_CHANNEL", "").strip() or None
         if browser_channel:
             options["channel"] = browser_channel
         self.browser_backend = browser_channel or "playwright-chromium"
-        return playwright.chromium.launch_persistent_context(str(profile), **options)
+        # Previous releases opened every browser channel against the same
+        # profile. Use fresh, separate Windows directories, retaining the old
+        # directory untouched in case the user needs to roll back.
+        selected_profile = Path(profile)
+        if sys.platform == "win32":
+            selected_profile = selected_profile.with_name(
+                f"{selected_profile.name}-{self.browser_backend}"
+            )
+        selected_profile.mkdir(parents=True, exist_ok=True)
+        return playwright.chromium.launch_persistent_context(str(selected_profile), **options)
 
     def _navigate_onebss(self, page):
         menu_name = "Kiểm soát viên - Kiểm soát tồn báo hỏng CNTT"
@@ -1576,25 +1622,10 @@ class ATSApp(tk.Tk):
             "target page, context or browser has been closed" in str(exc).lower()
         )
 
-    @staticmethod
-    def _browser_recovery_channels(failed_backends):
-        """Return untried browser backends in the safest platform order."""
-        if sys.platform == "win32":
-            candidates = ("chrome", "msedge", None)
-        elif sys.platform == "darwin":
-            candidates = ("chrome", None)
-        else:
-            candidates = (None,)
-        return tuple(
-            channel
-            for channel in candidates
-            if (channel or "playwright-chromium") not in failed_backends
-        )
-
     def _recover_closed_browser(
-        self, playwright, context, cycle, recovery_attempt, failed_backends
+        self, playwright, context, cycle, recovery_attempt
     ):
-        """Replace a crashed/closed context and restore the OneBSS workspace."""
+        """Restart only the current browser with its own persistent profile."""
         self.current_stage = f"Chu kỳ {cycle}: phục hồi Chromium sau khi bị đóng"
         self.write_log(
             "Browser/OneBSS đã bị đóng trong chu kỳ. "
@@ -1606,53 +1637,44 @@ class ATSApp(tk.Tk):
         except Exception:
             pass
 
-        # Never retry a backend that crashed in this Export. On Windows the
-        # rotation is Chromium → Chrome → Edge; this makes a long-running
-        # session recover even if the first fallback later crashes too.
-        channels = self._browser_recovery_channels(failed_backends)
-        if not channels:
-            raise RuntimeError(
-                "Các trình duyệt khả dụng đều đã bị đóng trong chu kỳ. "
-                "Hãy mở lại ứng dụng để tạo phiên OneBSS mới."
-            )
-        last_error = None
-        for channel in channels:
-            backend = channel or "playwright-chromium"
+        # Switching Chromium/Chrome/Edge with one user-data directory can
+        # corrupt browser state and cannot transfer an OTP-authenticated login.
+        channel = None if self.browser_backend == "playwright-chromium" else self.browser_backend
+        backend = self.browser_backend
+        for attempt in range(recovery_attempt, MAX_EXCEL_RECOVERY_ATTEMPTS + 1):
             new_context = None
             try:
-                self.write_log(f"Đang mở lại OneBSS bằng {backend}...")
+                self.write_log(
+                    f"Đang mở lại OneBSS bằng {backend} "
+                    f"(lần {attempt}/{MAX_EXCEL_RECOVERY_ATTEMPTS})..."
+                )
                 new_context = self._launch_browser_context(
-                    playwright,
-                    browser_channel=channel,
-                    use_configured_channel=False,
+                    playwright, browser_channel=channel, use_configured_channel=False
                 )
-                new_page = (
-                    new_context.pages[0] if new_context.pages else new_context.new_page()
-                )
+                new_page = new_context.pages[0] if new_context.pages else new_context.new_page()
                 self.browser_context, self.browser_page = new_context, new_page
                 new_page.goto(ONEBSS_URL, wait_until="domcontentloaded", timeout=30000)
                 self._ensure_onebss_session_active(new_page)
                 self._navigate_onebss(new_page)
                 self._ensure_onebss_session_active(new_page)
-                self.write_log(
-                    f"Đã mở lại OneBSS bằng {backend} và cấu hình xong; "
-                    "chạy lại tìm kiếm và xuất Excel."
-                )
-                return new_context, new_page
+                self.write_log(f"Đã mở lại OneBSS bằng {backend} và cấu hình xong.")
+                return new_context, new_page, attempt
+            except OneBSSSessionExpiredError:
+                raise
             except Exception as exc:
-                last_error = exc
-                self.write_log(f"Không mở được OneBSS bằng {backend}: {exc}")
+                self.write_log(f"Không mở lại được {backend}: {exc}")
                 try:
                     if new_context:
                         new_context.close()
                 except Exception:
                     pass
-        raise RuntimeError(f"Không thể khởi chạy lại OneBSS sau lỗi browser: {last_error}")
+                if attempt == MAX_EXCEL_RECOVERY_ATTEMPTS:
+                    raise
+                time.sleep(2)
 
     def _export_excel_with_recovery(self, playwright, context, page, cycle):
         """Run a complete cycle and recover from a browser disappearing at any stage."""
         recovery_attempt = 0
-        failed_backends = set()
         while True:
             try:
                 # Browser shutdowns can race with the start of a scheduled
@@ -1665,6 +1687,8 @@ class ATSApp(tk.Tk):
                 self.current_stage = f"Chu kỳ {cycle}: tìm kiếm và xuất Excel"
                 return context, page, self._export_excel(page, context)
             except Exception as exc:
+                if isinstance(exc, OneBSSSessionExpiredError):
+                    raise
                 recover_download = isinstance(exc, PlaywrightTimeoutError) and (
                     self._is_excel_download_timeout(exc)
                 )
@@ -1676,13 +1700,11 @@ class ATSApp(tk.Tk):
                     raise
                 recovery_attempt += 1
                 if recover_browser:
-                    failed_backends.add(self.browser_backend)
-                    context, page = self._recover_closed_browser(
+                    context, page, recovery_attempt = self._recover_closed_browser(
                         playwright,
                         context,
                         cycle,
                         recovery_attempt,
-                        failed_backends,
                     )
                 else:
                     self._recover_onebss_after_download_timeout(
@@ -1701,13 +1723,16 @@ class ATSApp(tk.Tk):
         deadline = time.monotonic() + timeout_seconds
         processing_seen = False
         next_progress_log = time.monotonic() + 30
+        next_session_check = time.monotonic()
 
         while time.monotonic() < deadline:
             if self.stop_requested:
                 raise RuntimeError("Đã dừng bởi người dùng")
             if page.is_closed():
                 raise RuntimeError("Trình duyệt đã đóng trong khi OneBSS đang tìm kiếm.")
-            self._ensure_onebss_session_active(page)
+            if time.monotonic() >= next_session_check:
+                self._ensure_onebss_session_active(page)
+                next_session_check = time.monotonic() + 5
 
             classes = (stop_control.get_attribute("class") or "").split()
             is_disabled = "disabled" in classes

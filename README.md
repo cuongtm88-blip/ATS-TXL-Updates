@@ -92,6 +92,11 @@ trong thư mục dữ liệu riêng của người dùng, không nằm trong th�
 vậy việc cập nhật không làm mất cấu hình. GitHub token chẩn đoán được lưu trong
 Windows Credential Manager, không ghi vào `settings.json`.
 
+Từ bản 1.1.3, Windows dùng hồ sơ Chromium mới, tách biệt Chrome/Edge; lần đầu
+sau cập nhật cần đăng nhập OneBSS và nhập OTP lại. Khi OneBSS hết phiên, ứng dụng
+cảnh báo riêng và dừng xuất báo cáo cho tới khi người dùng xác thực lại; bật
+"Giữ máy thức" không kéo dài phiên đăng nhập của OneBSS.
+
 Mỗi lần phát hành bản mới trên máy Windows dùng để build:
 
 1. Sửa mã nguồn cần thiết ở thư mục `ATS-TXL-Windows`.
