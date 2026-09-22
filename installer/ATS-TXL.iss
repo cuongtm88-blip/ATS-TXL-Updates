@@ -28,6 +28,16 @@ UninstallDisplayName=ATS TXL
 [Files]
 Source: "{#MySourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+#ifdef DiagnosticBuild
+[Dirs]
+Name: "C:\ATS-TXL-Dumps"
+
+[Registry]
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\chrome.exe"; ValueType: string; ValueName: "DumpFolder"; ValueData: "C:\ATS-TXL-Dumps"; Flags: uninsdeletevalue
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\chrome.exe"; ValueType: dword; ValueName: "DumpCount"; ValueData: "5"; Flags: uninsdeletevalue
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\chrome.exe"; ValueType: dword; ValueName: "DumpType"; ValueData: "2"; Flags: uninsdeletevalue
+#endif
+
 [Icons]
 Name: "{autoprograms}\ATS TXL"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\ATS TXL"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
@@ -37,3 +47,8 @@ Name: "desktopicon"; Description: "Tạo biểu tượng trên màn hình Deskto
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Mở ATS TXL"; Flags: nowait postinstall skipifsilent
+
+#ifdef DiagnosticBuild
+[UninstallDelete]
+Type: filesandordirs; Name: "C:\ATS-TXL-Dumps"
+#endif

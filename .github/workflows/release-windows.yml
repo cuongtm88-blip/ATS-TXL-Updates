@@ -2,6 +2,12 @@ name: Build and release Windows
 
 on:
   workflow_dispatch:
+    inputs:
+      diagnostic:
+        description: "Build dedicated diagnostic installer with Windows LocalDumps"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -62,7 +68,9 @@ jobs:
         run: |
           choco install innosetup --no-progress --yes
           $version = (python -c "from version import APP_VERSION; print(APP_VERSION)").Trim()
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" "installer\ATS-TXL.iss"
+          $args = @("/DMyAppVersion=$version")
+          if ("${{ inputs.diagnostic }}" -eq "true") { $args += "/DDiagnosticBuild" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" @args "installer\ATS-TXL.iss"
           if (!(Test-Path "dist/ATS-TXL-Setup.exe")) { throw "Inno Setup did not create ATS-TXL-Setup.exe" }
 
       - name: Create installer SHA-256 and read version
@@ -94,5 +102,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag "dist/ATS-TXL-Setup.exe#ATS-TXL-Setup.exe" "dist/ATS-TXL-Setup.exe.sha256#ATS-TXL-Setup.exe.sha256" --clobber --repo $env:GITHUB_REPOSITORY
           } else {
-            gh release create $tag "dist/ATS-TXL-Setup.exe#ATS-TXL-Setup.exe" "dist/ATS-TXL-Setup.exe.sha256#ATS-TXL-Setup.exe.sha256" --repo $env:GITHUB_REPOSITORY --title "ATS TXL v$env:VERSION" --notes-file RELEASE_NOTES.md --latest
+            $releaseArgs = @($tag, "dist/ATS-TXL-Setup.exe#ATS-TXL-Setup.exe", "dist/ATS-TXL-Setup.exe.sha256#ATS-TXL-Setup.exe.sha256", "--repo", $env:GITHUB_REPOSITORY, "--title", "ATS TXL v$env:VERSION", "--notes-file", "RELEASE_NOTES.md")
+            if ("${{ inputs.diagnostic }}" -eq "true") { $releaseArgs += "--prerelease" } else { $releaseArgs += "--latest" }
+            gh release create @releaseArgs
           }

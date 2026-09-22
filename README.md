@@ -101,6 +101,29 @@ lại với khoảng nghỉ tăng dần. Khi OneBSS hết phiên, ứng dụng b
 browser mở để người dùng đăng nhập/OTP lại rồi bấm bước 2; không xuất báo cáo
 thiếu bản ghi. Bật "Giữ máy thức" không kéo dài phiên đăng nhập của OneBSS.
 
+### Bản test chẩn đoán sâu 1.1.7-diagnostic
+
+Bản `1.1.7-diagnostic` là GitHub prerelease dành riêng cho máy test, không dùng
+để cập nhật các máy đang chạy bản ổn định. Bộ cài tạo cấu hình Windows LocalDumps
+cho Chromium `chrome.exe`, lưu dump đầy đủ tại `C:\ATS-TXL-Dumps` và giữ tối đa
+5 dump. Vì LocalDumps áp dụng theo tên `chrome.exe`, nên khi test cần đóng các
+Chrome/Chromium khác trên máy để tránh tạo dump ngoài ATS TXL.
+
+Quy trình test:
+
+1. Đóng ATS TXL, Chrome và Chromium khác trên máy Windows test.
+2. Cài `ATS-TXL-Setup.exe` của bản `1.1.7-diagnostic` bằng quyền Administrator.
+3. Mở ATS TXL, cấu hình GitHub Diagnostics private và bật gửi gói chẩn đoán.
+   Chỉ bật kèm trace/ảnh nếu chấp nhận dữ liệu OneBSS có thể xuất hiện trong đó.
+4. Chạy đúng quy trình cho đến khi browser đóng. Không xóa thư mục
+   `C:\ATS-TXL-Dumps` và không gỡ ứng dụng trước khi thu thập xong.
+5. Gửi cho người kiểm tra tên các file dump, gói diagnostics và thời điểm lỗi.
+   Không tự tải dump lên GitHub nếu chưa kiểm tra vì dump có thể chứa dữ liệu
+   phiên đăng nhập và dữ liệu nghiệp vụ.
+6. Sau khi kết thúc test, gỡ bản diagnostic trong Windows Apps. Bộ gỡ cài đặt
+   sẽ xóa cấu hình LocalDumps và thư mục `C:\ATS-TXL-Dumps`; nếu cần giữ dump,
+   hãy sao chép chúng ra nơi an toàn trước khi gỡ.
+
 Mỗi lần phát hành bản mới trên máy Windows dùng để build:
 
 1. Sửa mã nguồn cần thiết ở thư mục `ATS-TXL-Windows`.

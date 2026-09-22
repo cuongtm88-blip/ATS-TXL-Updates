@@ -1,3 +1,10 @@
+## Nội dung cập nhật 1.1.7-diagnostic
+
+- Bản riêng cho máy test, phát hành dạng GitHub prerelease; không thay thế bản ổn định 1.1.6.
+- Bộ cài bật Windows LocalDumps cho Chromium `chrome.exe`: dump đầy đủ, tối đa 5 file, lưu tại `C:\ATS-TXL-Dumps`.
+- Khi gỡ bản diagnostic, bộ cài gỡ cấu hình LocalDumps và thư mục dump của bản test.
+- Chỉ dùng trên máy test; dump có thể chứa dữ liệu đang hiển thị trong OneBSS và không được gửi lên GitHub nếu chưa kiểm tra nội dung.
+
 ## Nội dung cập nhật 1.1.6
 
 - Mở rộng gói chẩn đoán Windows khi browser đóng: đọc thêm Application, System, Security, Windows Error Reporting, Defender, AppLocker, Reliability Monitor và các thư mục WER gần thời điểm lỗi.
