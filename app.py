@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+import shutil
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -1067,6 +1068,7 @@ class ATSApp(tk.Tk):
         self._active_export_diagnostic = {
             "id": uuid.uuid4().hex[:10],
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "started_epoch": time.time(),
             "context": context,
             "backend": self.browser_backend,
             "page_url": self._safe_page_url(page),
@@ -1228,6 +1230,19 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         folder = APP_DATA / DIAGNOSTICS_DIRNAME / f"export_{timestamp}_{active['id']}"
         folder.mkdir(parents=True, exist_ok=True)
+        dump_paths = []
+        if sys.platform == "win32":
+            try:
+                dump_root = Path(r"C:\ATS-TXL-Dumps")
+                dump_folder = folder / "windows-dumps"
+                for dump in dump_root.glob("*.dmp"):
+                    if dump.is_file() and dump.stat().st_mtime >= active.get("started_epoch", 0):
+                        dump_folder.mkdir(parents=True, exist_ok=True)
+                        copied = dump_folder / dump.name
+                        shutil.copy2(dump, copied)
+                        dump_paths.append(str(copied))
+            except Exception as dump_exc:
+                (folder / "dump-copy-error.txt").write_text(str(dump_exc), encoding="utf-8")
         screenshot_path = folder / "onebss-error.png"
         screenshot_error = ""
         try:
@@ -1255,6 +1270,8 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "trace_error": trace_error,
             "screenshot_path": str(screenshot_path) if screenshot_path.exists() else "",
             "screenshot_error": screenshot_error,
+            "windows_dump_count": len(dump_paths),
+            "windows_dumps": dump_paths,
         }
         (folder / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"

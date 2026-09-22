@@ -1,3 +1,9 @@
+## Nội dung cập nhật 1.1.8-diagnostic
+
+- Tự động phát hiện và sao chép Chromium crash dump mới từ `C:\ATS-TXL-Dumps` vào gói chẩn đoán lỗi.
+- Ghi số lượng và đường dẫn dump trong `summary.json`; nếu không đọc/copy được sẽ ghi `dump-copy-error.txt`.
+- Vẫn là GitHub prerelease dành riêng cho máy test, không thay thế bản ổn định.
+
 ## Nội dung cập nhật 1.1.7-diagnostic
 
 - Bản riêng cho máy test, phát hành dạng GitHub prerelease; không thay thế bản ổn định 1.1.6.
