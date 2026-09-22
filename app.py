@@ -79,10 +79,20 @@ DIAGNOSTICS_DIRNAME = "diagnostics"
 DIAGNOSTICS_SECRET_SERVICE = "ATS-TXL"
 DIAGNOSTICS_SECRET_NAME = "github-diagnostics-token"
 DEFAULT_DIAGNOSTICS_REPOSITORY = "cuongtm88-blip/ATS-TXL-Diagnostics"
-DIAGNOSTIC_BROWSER_CHOICES = {
+BROWSER_CHOICES = {
+    "Google Chrome (mặc định)": "chrome",
+    "Microsoft Edge": "msedge",
     "Chromium tích hợp (Playwright)": None,
-    "Google Chrome cài sẵn": "chrome",
 }
+LEGACY_BROWSER_CHOICES = {
+    "Google Chrome cài sẵn": "Google Chrome (mặc định)",
+}
+ONEBSS_EXPIRY_WARNING_SECONDS = 15 * 60
+
+
+def _normalise_browser_choice(value, default):
+    value = LEGACY_BROWSER_CHOICES.get(str(value or ""), str(value or ""))
+    return value if value in BROWSER_CHOICES else default
 
 
 class OneBSSSessionExpiredError(RuntimeError):
@@ -210,12 +220,18 @@ class ATSApp(tk.Tk):
         self.browser_page = None
         self.browser_backend = "playwright-chromium"
         self.deep_diagnostic_mode = DEEP_DIAGNOSTIC_MODE
-        saved_diagnostic_browser = saved.get(
-            "diagnostic_browser_choice", "Chromium tích hợp (Playwright)"
+        default_browser = (
+            "Chromium tích hợp (Playwright)"
+            if self.deep_diagnostic_mode
+            else "Google Chrome (mặc định)"
         )
-        if saved_diagnostic_browser not in DIAGNOSTIC_BROWSER_CHOICES:
-            saved_diagnostic_browser = "Chromium tích hợp (Playwright)"
-        self.diagnostic_browser_choice = tk.StringVar(value=saved_diagnostic_browser)
+        saved_browser = saved.get("browser_choice", saved.get("diagnostic_browser_choice", default_browser))
+        self.browser_choice = tk.StringVar(
+            value=_normalise_browser_choice(saved_browser, default_browser)
+        )
+        self._onebss_token_expires_at = None
+        self._onebss_expiry_warning_for = None
+        self._onebss_expired_alert_for = None
         self._browser_launches = []
         self._browser_profile_path = None
         self._browser_native_log_path = None
@@ -229,6 +245,7 @@ class ATSApp(tk.Tk):
         self.update_in_progress = False
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(60000, self._tick_onebss_token_status)
         try:
             self._apply_diagnostics_config()
         except Exception as exc:
@@ -332,21 +349,6 @@ class ATSApp(tk.Tk):
             diagnostics_box,
             text="Token chỉ lưu trong Windows Credential Manager/Keychain; không ghi vào settings.json hay GitHub public.",
         ).grid(row=3, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
-        if self.deep_diagnostic_mode:
-            ttk.Label(diagnostics_box, text="Browser A/B test").grid(
-                row=4, column=0, sticky="w", **pad
-            )
-            ttk.Combobox(
-                diagnostics_box,
-                textvariable=self.diagnostic_browser_choice,
-                values=tuple(DIAGNOSTIC_BROWSER_CHOICES),
-                state="readonly",
-                width=30,
-            ).grid(row=4, column=1, columnspan=2, sticky="w", **pad)
-            ttk.Label(
-                diagnostics_box,
-                text="Mỗi lần chỉ chạy một browser; phải đăng nhập/OTP lại khi đổi browser.",
-            ).grid(row=5, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
         diagnostics_box.columnconfigure(2, weight=1)
 
         actions = ttk.Frame(self)
@@ -365,6 +367,16 @@ class ATSApp(tk.Tk):
             variable=self.keep_awake_enabled,
             command=self._on_keep_awake_changed,
         ).pack(side="left", padx=(12, 0))
+        ttk.Label(actions, text="Trình duyệt OneBSS:").pack(side="left", padx=(14, 4))
+        ttk.Combobox(
+            actions,
+            textvariable=self.browser_choice,
+            values=tuple(BROWSER_CHOICES),
+            state="readonly",
+            width=27,
+        ).pack(side="left")
+        self.onebss_token_status = tk.StringVar(value="Phiên OneBSS: chưa kiểm tra")
+        ttk.Label(actions, textvariable=self.onebss_token_status).pack(side="left", padx=(14, 0))
 
         self.progress = ttk.Progressbar(self, mode="indeterminate")
         self.progress.pack(fill="x", padx=12, pady=(0, 8))
@@ -714,7 +726,7 @@ class ATSApp(tk.Tk):
                 "schedule_enabled": self.auto_repeat,
                 "repeat_minutes": interval_minutes,
                 "keep_awake_enabled": bool(self.keep_awake_enabled.get()),
-                "diagnostic_browser_choice": self.diagnostic_browser_choice.get(),
+                "browser_choice": self.browser_choice.get(),
             })
             self._apply_diagnostics_config(settings)
             _save_settings(settings)
@@ -1522,6 +1534,8 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             DOWNLOADS.mkdir(exist_ok=True)
             with sync_playwright() as p:
                 self._start_process_exit_monitor()
+                selected_browser = self.browser_choice.get()
+                self.write_log(f"Đang mở OneBSS bằng {selected_browser}...")
                 ctx = self._launch_browser_context(p)
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 self.browser_context, self.browser_page = ctx, page
@@ -1600,15 +1614,9 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             self.after(0, self.progress.stop)
             self.after(0, self._release_keep_awake)
 
-    def _onebss_session_expired(self, page):
-        if page.is_closed():
-            return False
-        url = page.url.lower()
-        if any(marker in url for marker in ("login", "signin", "auth")):
-            return True
-        # OneBSS stores its access JWT in localStorage['OneBSS-Token'] and can
-        # leave the inventory screen visible after expiry. Return only its exp;
-        # never copy the token into Python, logs, or diagnostic uploads.
+    @staticmethod
+    def _onebss_token_expiry(page):
+        """Read only the JWT expiry claim; never return the token itself."""
         try:
             expires_at = page.evaluate("""() => {
                 try {
@@ -1620,12 +1628,107 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                     return typeof claims.exp === 'number' ? claims.exp : 0;
                 } catch (_) { return 0; }
             }""")
-            if expires_at is not None and float(expires_at) <= time.time() + 30:
-                return True
+            return float(expires_at or 0)
         except Exception:
-            # Login-page detection below remains available when storage is
-            # inaccessible (e.g. while navigation is in progress).
-            pass
+            return 0
+
+    def _set_onebss_token_status(self, expires_at):
+        self._onebss_token_expires_at = expires_at or None
+        if not expires_at:
+            text = "Phiên OneBSS: chưa xác định/chưa đăng nhập"
+        else:
+            remaining = int(expires_at - time.time())
+            if remaining <= 0:
+                text = "Phiên OneBSS: đã hết hạn — cần đăng nhập lại"
+            else:
+                hours, remainder = divmod(remaining, 3600)
+                minutes = remainder // 60
+                expires_text = time.strftime("%H:%M", time.localtime(expires_at))
+                text = f"Phiên OneBSS: còn {hours} giờ {minutes} phút (đến {expires_text})"
+        self.after(0, lambda text=text: self.onebss_token_status.set(text))
+
+    def _tick_onebss_token_status(self):
+        """Keep the token countdown and expiry alert active between cycles."""
+        expires_at = self._onebss_token_expires_at
+        if expires_at:
+            self._set_onebss_token_status(expires_at)
+            worker = getattr(self, "worker", None)
+            if worker and worker.is_alive():
+                remaining = expires_at - time.time()
+                if remaining <= 30:
+                    threading.Thread(
+                        target=self._send_onebss_session_alert,
+                        args=(expires_at,),
+                        daemon=True,
+                    ).start()
+                elif remaining <= ONEBSS_EXPIRY_WARNING_SECONDS:
+                    threading.Thread(
+                        target=self._send_onebss_session_alert,
+                        args=(expires_at,),
+                        kwargs={"expiring": True},
+                        daemon=True,
+                    ).start()
+        self.after(60000, self._tick_onebss_token_status)
+
+    def _send_onebss_session_alert(self, expires_at, *, expiring=False):
+        key = int(expires_at or 0)
+        attribute = "_onebss_expiry_warning_for" if expiring else "_onebss_expired_alert_for"
+        if getattr(self, attribute, None) == key:
+            return
+        setattr(self, attribute, key)
+        if not self._error_recipient_ids:
+            self.write_log("Chưa cấu hình người nhận cảnh báo phiên OneBSS.")
+            return
+        remaining = max(0, int((expires_at or time.time()) - time.time()))
+        expires_text = time.strftime("%d/%m/%Y %H:%M:%S", time.localtime(expires_at or time.time()))
+        if expiring:
+            title = "⚠️ PHIÊN ONEBSS SẮP HẾT HẠN"
+            instruction = (
+                f"Phiên sẽ hết hạn sau khoảng {max(1, remaining // 60)} phút. "
+                "Hãy chuẩn bị đăng nhập và nhập OTP khi OneBSS yêu cầu."
+            )
+        else:
+            title = "🔐 PHIÊN ONEBSS ĐÃ HẾT HẠN"
+            instruction = (
+                "ATS TXL đã giữ trình duyệt mở và tạm dừng xuất Excel. "
+                "Hãy đăng nhập OneBSS, nhập OTP trong trình duyệt đang mở, rồi bấm bước 2 để tiếp tục."
+            )
+        message = "\n".join([
+            f"<b>{title}</b>",
+            f"<i>{time.strftime('%d/%m/%Y %H:%M:%S')}</i>",
+            "",
+            f"<b>Máy:</b> {html.escape(socket.gethostname())}",
+            f"<b>Browser:</b> {html.escape(self.browser_backend)}",
+            f"<b>Token hết hạn lúc:</b> {expires_text}",
+            "",
+            html.escape(instruction),
+        ])
+        successes, _ = self._send_private_message(message)
+        self.write_log(
+            f"Cảnh báo phiên OneBSS: gửi thành công {len(successes)}/{len(self._error_recipient_ids)} người nhận."
+        )
+
+    def _maybe_warn_onebss_session_expiring(self, expires_at):
+        remaining = (expires_at or 0) - time.time()
+        if (
+            30 < remaining <= ONEBSS_EXPIRY_WARNING_SECONDS
+            and self._onebss_expiry_warning_for != int(expires_at or 0)
+        ):
+            self._send_onebss_session_alert(expires_at, expiring=True)
+
+    def _onebss_session_expired(self, page, expires_at=None):
+        if page.is_closed():
+            return False
+        url = page.url.lower()
+        if any(marker in url for marker in ("login", "signin", "auth")):
+            return True
+        # OneBSS stores its access JWT in localStorage['OneBSS-Token'] and can
+        # leave the inventory screen visible after expiry. Return only its exp;
+        # never copy the token into Python, logs, or diagnostic uploads.
+        if expires_at is None:
+            expires_at = ATSApp._onebss_token_expiry(page)
+        if expires_at <= time.time() + 30:
+            return True
         try:
             password = page.locator('input[type="password"]').first
             return password.count() > 0 and password.is_visible(timeout=300)
@@ -1637,7 +1740,10 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             raise RuntimeError(
                 "Trình duyệt OneBSS đã bị đóng. Hãy mở lại ứng dụng để tiếp tục."
             )
-        if self._onebss_session_expired(page):
+        expires_at = self._onebss_token_expiry(page)
+        self._set_onebss_token_status(expires_at)
+        self._maybe_warn_onebss_session_expiring(expires_at)
+        if self._onebss_session_expired(page, expires_at):
             raise OneBSSSessionExpiredError(
                 "Phiên đăng nhập OneBSS đã hết hạn. Hãy đăng nhập và nhập OTP lại "
                 "trong trình duyệt đang mở, sau đó bấm bước 2. Chương trình không tự xuất Excel "
@@ -1653,7 +1759,8 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "Nếu trang vẫn hiện danh sách, hãy đăng xuất OneBSS, đăng nhập/nhập OTP "
             "trong trình duyệt rồi bấm nút 2 để tiếp tục."
         )
-        self._send_workflow_error_alert(str(reason))
+        self._set_onebss_token_status(self._onebss_token_expires_at or 0)
+        self._send_onebss_session_alert(self._onebss_token_expires_at or time.time())
         while not self.stop_requested:
             if not self.start_event.wait(timeout=1):
                 continue
@@ -1688,12 +1795,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "viewport": {"width": 1440, "height": 900},
         }
         if browser_channel is None and use_configured_channel:
-            if getattr(self, "deep_diagnostic_mode", False):
-                browser_channel = DIAGNOSTIC_BROWSER_CHOICES.get(
-                    self.diagnostic_browser_choice.get(), None
-                )
-            else:
-                browser_channel = os.getenv("ATS_BROWSER_CHANNEL", "").strip() or None
+            browser_channel = BROWSER_CHOICES.get(self.browser_choice.get(), "chrome")
         if browser_channel:
             options["channel"] = browser_channel
         self.browser_backend = browser_channel or "playwright-chromium"
@@ -1720,7 +1822,15 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 "--v=1",
                 f"--log-file={native_log}",
             ]
-        context = playwright.chromium.launch_persistent_context(str(selected_profile), **options)
+        try:
+            context = playwright.chromium.launch_persistent_context(str(selected_profile), **options)
+        except Exception as exc:
+            if browser_channel:
+                raise RuntimeError(
+                    f"Không mở được {self.browser_choice.get()}. Hãy kiểm tra browser đã được cài "
+                    "hoặc chọn browser khác trong ATS TXL."
+                ) from exc
+            raise
         if getattr(self, "deep_diagnostic_mode", False):
             self._browser_launches.append(
                 {

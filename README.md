@@ -99,7 +99,11 @@ sau cập nhật cần đăng nhập OneBSS và nhập OTP lại. Từ bản 1.1
 quá 10 phút, ứng dụng giữ browser mở, làm mới tab, cấu hình lại bộ lọc và thử
 lại với khoảng nghỉ tăng dần. Khi OneBSS hết phiên, ứng dụng báo riêng và giữ
 browser mở để người dùng đăng nhập/OTP lại rồi bấm bước 2; không xuất báo cáo
-thiếu bản ghi. Bật "Giữ máy thức" không kéo dài phiên đăng nhập của OneBSS.
+thiếu bản ghi. Từ bản 1.1.12, Windows mặc định dùng Google Chrome và có thể
+chọn Microsoft Edge hoặc Chromium tích hợp. Mỗi browser dùng profile OneBSS
+riêng nên khi đổi browser cần đăng nhập/OTP lại. Giao diện hiển thị thời gian
+còn lại của access token OneBSS; Telegram cảnh báo khi còn tối đa 15 phút và
+khi phiên hết hạn. Bật "Giữ máy thức" không kéo dài phiên đăng nhập OneBSS.
 
 ### Bản test chẩn đoán sâu 1.1.11-diagnostic
 

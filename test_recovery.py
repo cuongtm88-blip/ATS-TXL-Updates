@@ -56,18 +56,21 @@ class RecoveryTests(unittest.TestCase):
             finally:
                 browser.close()
 
-    def test_windows_uses_bundled_chromium_and_separate_profile(self):
+    def test_windows_uses_selected_browser_and_separate_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
             browser = Mock()
-            state = SimpleNamespace(browser_backend="")
+            state = SimpleNamespace(
+                browser_backend="",
+                browser_choice=SimpleNamespace(get=lambda: "Google Chrome (mặc định)"),
+            )
             profile = Path(temporary) / "chrome-profile"
             with patch.object(app.sys, "platform", "win32"), patch.dict(app.os.environ, {"ATS_BROWSER_CHANNEL": ""}):
                 app.ATSApp._launch_browser_context(state, browser, profile=profile)
                 default_profile = browser.chromium.launch_persistent_context.call_args.args[0]
                 default_options = browser.chromium.launch_persistent_context.call_args.kwargs
-                self.assertEqual(state.browser_backend, "playwright-chromium")
-                self.assertEqual(Path(default_profile).name, "chrome-profile-playwright-chromium")
-                self.assertNotIn("channel", default_options)
+                self.assertEqual(state.browser_backend, "chrome")
+                self.assertEqual(Path(default_profile).name, "chrome-profile-chrome")
+                self.assertEqual(default_options["channel"], "chrome")
 
                 app.ATSApp._launch_browser_context(state, browser, profile=profile, browser_channel="msedge")
                 edge_profile = browser.chromium.launch_persistent_context.call_args.args[0]
@@ -87,6 +90,9 @@ class RecoveryTests(unittest.TestCase):
             _launch_browser_context=Mock(return_value=new_context),
             _ensure_onebss_session_active=Mock(),
             _navigate_onebss=Mock(),
+            _set_onebss_token_status=Mock(),
+            _onebss_token_expires_at=0,
+            _send_onebss_session_alert=Mock(),
         )
         result = app.ATSApp._recover_closed_browser(state, Mock(), old_context, 2, 1)
         self.assertEqual(result, (new_context, new_page, 1))
@@ -237,6 +243,9 @@ class RecoveryTests(unittest.TestCase):
             start_event=event,
             write_log=Mock(),
             _send_workflow_error_alert=Mock(),
+            _set_onebss_token_status=Mock(),
+            _onebss_token_expires_at=0,
+            _send_onebss_session_alert=Mock(),
             _ensure_onebss_session_active=Mock(
                 side_effect=[app.OneBSSSessionExpiredError("expired"), None, None]
             ),
@@ -277,6 +286,7 @@ class RecoveryTests(unittest.TestCase):
             _send_workflow_error_alert=Mock(),
             write_log=Mock(),
             after=Mock(),
+            browser_choice=SimpleNamespace(get=lambda: "Google Chrome (mặc định)"),
         )
         state._wait_for_reauthentication.side_effect = (
             lambda *_: context.close.assert_not_called()
@@ -331,13 +341,26 @@ class RecoveryTests(unittest.TestCase):
     def test_diagnostic_upload_never_includes_native_chromium_log(self):
         self.assertNotIn("chromium-native.log", diagnostics_upload.DEFAULT_FILES)
 
+    def test_token_expiry_warning_is_sent_once_per_token(self):
+        expiry = time.time() + 10 * 60
+        state = SimpleNamespace(
+            _onebss_expiry_warning_for=None,
+        )
+        def send_alert(expires_at, *, expiring):
+            self.assertTrue(expiring)
+            state._onebss_expiry_warning_for = int(expires_at)
+        state._send_onebss_session_alert = Mock(side_effect=send_alert)
+        app.ATSApp._maybe_warn_onebss_session_expiring(state, expiry)
+        app.ATSApp._maybe_warn_onebss_session_expiring(state, expiry)
+        state._send_onebss_session_alert.assert_called_once_with(expiry, expiring=True)
+
     def test_deep_diagnostic_can_select_installed_chrome_for_ab_test(self):
         with tempfile.TemporaryDirectory() as temporary:
             browser = Mock()
             state = SimpleNamespace(
                 browser_backend="",
                 deep_diagnostic_mode=True,
-                diagnostic_browser_choice=SimpleNamespace(get=lambda: "Google Chrome cài sẵn"),
+                browser_choice=SimpleNamespace(get=lambda: "Google Chrome (mặc định)"),
                 _browser_launches=[],
                 _windows_browser_processes=Mock(return_value=[]),
             )

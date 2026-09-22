@@ -1,3 +1,18 @@
+## Nội dung cập nhật 1.1.12
+
+- Bản vận hành chính thức Windows: chọn **Google Chrome**, **Microsoft Edge**
+  hoặc **Chromium tích hợp (Playwright)** ngay trên giao diện. Google Chrome là
+  mặc định vì bản A/B trên máy lỗi đã cho thấy Chrome chạy ổn định hơn Chromium
+  tích hợp tại bước Xuất Excel.
+- Mỗi browser dùng profile OneBSS riêng; khi đổi browser, cần đăng nhập và OTP
+  lại một lần trong browser vừa chọn. ATS TXL không tự luân chuyển browser khi
+  có lỗi, mà giữ đúng browser người dùng đã chọn.
+- Đọc duy nhất trường hết hạn (`exp`) của access token OneBSS, hiển thị đếm
+  ngược thời gian còn lại trên giao diện; không ghi hoặc gửi token.
+- Gửi Telegram riêng khi token còn tối đa 15 phút và khi phiên đã hết hạn. Cảnh
+  báo hết hạn ghi rõ ATS TXL đã giữ browser mở, người dùng cần đăng nhập/OTP lại
+  rồi bấm bước 2; không nhầm với cảnh báo browser crash.
+
 ## Nội dung cập nhật 1.1.11-diagnostic
 
 - Bản test xác minh nguyên nhân Chromium crash tại lúc Xuất Excel; không phải
