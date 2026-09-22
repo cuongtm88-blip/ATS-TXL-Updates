@@ -101,13 +101,18 @@ lại với khoảng nghỉ tăng dần. Khi OneBSS hết phiên, ứng dụng b
 browser mở để người dùng đăng nhập/OTP lại rồi bấm bước 2; không xuất báo cáo
 thiếu bản ghi. Bật "Giữ máy thức" không kéo dài phiên đăng nhập của OneBSS.
 
-### Bản test chẩn đoán sâu 1.1.7-diagnostic
+### Bản test chẩn đoán sâu 1.1.10-diagnostic
 
-Bản `1.1.7-diagnostic` là GitHub prerelease dành riêng cho máy test, không dùng
+Bản `1.1.10-diagnostic` là GitHub prerelease dành riêng cho máy test, không dùng
 để cập nhật các máy đang chạy bản ổn định. Bộ cài tạo cấu hình Windows LocalDumps
 cho Chromium `chrome.exe`, lưu dump đầy đủ tại `C:\ATS-TXL-Dumps` và giữ tối đa
 5 dump. Vì LocalDumps áp dụng theo tên `chrome.exe`, nên khi test cần đóng các
 Chrome/Chromium khác trên máy để tránh tạo dump ngoài ATS TXL.
+
+Bản này dừng tại lỗi đầu tiên và không tự phục hồi browser. Nó lưu PIDs, command
+line, mã thoát Windows, native Chromium log và Crashpad index để phân biệt crash
+Chromium, Windows kết thúc tiến trình hay lỗi điều phối Playwright. Các thông tin
+này chỉ được bật trong bộ cài diagnostic, không xuất hiện ở bản vận hành bình thường.
 
 Quy trình test:
 

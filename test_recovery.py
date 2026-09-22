@@ -260,6 +260,8 @@ class RecoveryTests(unittest.TestCase):
             progress=Mock(),
             _last_diagnostic_path=None,
             _launch_browser_context=Mock(return_value=context),
+            _start_process_exit_monitor=Mock(),
+            _stop_process_exit_monitor=Mock(),
             _onebss_session_expired=Mock(return_value=False),
             _ensure_onebss_session_active=Mock(),
             _acquire_keep_awake=Mock(),
@@ -285,7 +287,25 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(state._export_excel_with_recovery.call_count, 2)
         state._wait_for_reauthentication.assert_called_once()
         state._process_and_send.assert_called_once_with("report.xlsx")
+        state._start_process_exit_monitor.assert_called_once()
+        state._stop_process_exit_monitor.assert_called_once()
         context.close.assert_called_once()
+
+    def test_deep_diagnostic_stops_on_first_browser_error(self):
+        context = Mock()
+        page = Mock()
+        state = SimpleNamespace(
+            current_stage="",
+            deep_diagnostic_mode=True,
+            _ensure_onebss_session_active=Mock(),
+            _refresh_cycle_dates=Mock(),
+            _export_excel=Mock(side_effect=RuntimeError("Target page, context or browser has been closed")),
+            write_log=Mock(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "Target page"):
+            app.ATSApp._export_excel_with_recovery(state, Mock(), context, page, 1)
+        state.write_log.assert_called_once()
+        context.close.assert_not_called()
 
     def test_windows_diagnostics_do_not_open_console(self):
         completed = SimpleNamespace(stdout="", stderr="")

@@ -57,6 +57,13 @@ def _app_data_dir():
 
 APP_DATA = _app_data_dir()
 SETTINGS_PATH = APP_DATA / "settings.json"
+APPLICATION_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
+# This marker is shipped only in the dedicated diagnostic installer. Keeping
+# it beside the executable avoids changing any settings on a normal install.
+DEEP_DIAGNOSTIC_MODE = (
+    os.getenv("ATS_TXL_DEEP_DIAGNOSTIC", "").strip() == "1"
+    or (APPLICATION_DIR / "ATS-TXL.deep-diagnostic").is_file()
+)
 if getattr(sys, "frozen", False):
     PROFILE = APP_DATA / "chrome-profile"
     DOWNLOADS = Path.home() / "Downloads" / "ATS-TXL"
@@ -198,6 +205,12 @@ class ATSApp(tk.Tk):
         self.browser_context = None
         self.browser_page = None
         self.browser_backend = "playwright-chromium"
+        self.deep_diagnostic_mode = DEEP_DIAGNOSTIC_MODE
+        self._browser_launches = []
+        self._browser_profile_path = None
+        self._browser_native_log_path = None
+        self._process_exit_monitor = None
+        self._process_exit_monitor_paths = {}
         self._active_export_diagnostic = None
         self._diagnostic_context_ids = set()
         self._diagnostic_page_ids = set()
@@ -211,7 +224,13 @@ class ATSApp(tk.Tk):
         except Exception as exc:
             self.write_log(f"Chẩn đoán GitHub chưa sẵn sàng: {exc}")
         self.after(5000, self._retry_pending_diagnostics)
-        if updater.can_self_update():
+        if self.deep_diagnostic_mode:
+            self.update_btn.configure(state="disabled", text="Bản test chẩn đoán")
+            self.write_log(
+                "BẢN TEST CHẨN ĐOÁN: chỉ dùng Chromium; dừng tại lỗi đầu tiên, "
+                "không tự phục hồi hoặc tự cập nhật."
+            )
+        elif updater.can_self_update():
             self.after(2500, self._automatic_update_tick)
 
     def _build_ui(self):
@@ -355,6 +374,7 @@ class ATSApp(tk.Tk):
     def _on_close(self):
         """Release the temporary no-sleep request before the UI exits."""
         self.request_stop()
+        self._stop_process_exit_monitor()
         self._release_keep_awake()
         self.destroy()
 
@@ -1074,8 +1094,14 @@ class ATSApp(tk.Tk):
             "page_url": self._safe_page_url(page),
             "events": [],
             "trace_started": False,
-            "browser_processes_before": self._windows_browser_processes(),
+            "browser_processes_before": self._windows_browser_processes(
+                include_command_line=getattr(self, "deep_diagnostic_mode", False)
+            ),
             "windows_extended_before": self._windows_extended_diagnostics(),
+            "browser_launches": list(self._browser_launches),
+            "profile_path": str(self._browser_profile_path or ""),
+            "native_log_path": str(self._browser_native_log_path or ""),
+            "process_exit_monitor": dict(self._process_exit_monitor_paths),
         }
         self._attach_context_diagnostics(context, page)
         try:
@@ -1117,14 +1143,22 @@ class ATSApp(tk.Tk):
             return f"Không đọc được Windows Event Log: {exc}"
 
     @staticmethod
-    def _windows_browser_processes():
-        """Snapshot browser processes around an Export without collecting command lines."""
+    def _windows_browser_processes(include_command_line=False):
+        """Snapshot browser processes around an Export.
+
+        Command lines are included only in the dedicated diagnostic build.
+        They identify the exact bundled Chromium and profile but are kept in
+        the private diagnostic repository only.
+        """
         if sys.platform != "win32":
             return "Không áp dụng: không phải Windows."
+        fields = "ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate"
+        if include_command_line:
+            fields += ",CommandLine,WorkingSetSize,HandleCount"
         command = (
             "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='chromium.exe' OR Name='msedge.exe'\" "
             "-ErrorAction SilentlyContinue | "
-            "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate | "
+            f"Select-Object {fields} | "
             "ConvertTo-Json -Depth 3"
         )
         try:
@@ -1139,6 +1173,96 @@ class ATSApp(tk.Tk):
             return result.stdout.strip() or result.stderr.strip() or "Không có browser process phù hợp."
         except Exception as exc:
             return f"Không đọc được browser process: {exc}"
+
+    @staticmethod
+    def _read_file_tail(path, limit=1_000_000):
+        """Return the last part of a diagnostic log without exhausting disk/RAM."""
+        try:
+            path = Path(path)
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - limit))
+                return stream.read().decode("utf-8", errors="replace")
+        except OSError as exc:
+            return f"Không đọc được log Chromium: {exc}"
+
+    def _start_process_exit_monitor(self):
+        """Watch Windows process exits while a dedicated test is running.
+
+        Win32_ProcessStopTrace records a process ExitStatus even when Windows
+        Error Reporting does not create a dump. Events are later correlated
+        with the Chromium PIDs saved at launch.
+        """
+        if (
+            not getattr(self, "deep_diagnostic_mode", False)
+            or sys.platform != "win32"
+            or self._process_exit_monitor is not None
+        ):
+            return
+        runtime = APP_DATA / DIAGNOSTICS_DIRNAME / "runtime"
+        runtime.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        events_path = runtime / f"process-exit_{stamp}.jsonl"
+        script_path = runtime / f"watch-process-exit_{stamp}.ps1"
+        script_path.write_text(
+            r'''param([string]$OutputPath)
+$query = "SELECT * FROM Win32_ProcessStopTrace WHERE ProcessName='chrome.exe' OR ProcessName='chromium.exe' OR ProcessName='msedge.exe'"
+$watcher = New-Object System.Management.ManagementEventWatcher $query
+try {
+  while ($true) {
+    $event = $watcher.WaitForNextEvent()
+    [pscustomobject]@{
+      collected_at = [DateTime]::UtcNow.ToString('o')
+      process_id = [int]$event.ProcessID
+      parent_process_id = [int]$event.ParentProcessID
+      process_name = [string]$event.ProcessName
+      exit_status = [uint32]$event.ExitStatus
+      session_id = [uint32]$event.SessionID
+      event_time_raw = [string]$event.TIME_CREATED
+    } | ConvertTo-Json -Compress | Add-Content -LiteralPath $OutputPath -Encoding utf8
+  }
+} finally {
+  if ($watcher) { $watcher.Stop(); $watcher.Dispose() }
+}
+''',
+            encoding="utf-8",
+        )
+        try:
+            process = subprocess.Popen(
+                [
+                    "powershell.exe", "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass", "-File", str(script_path),
+                    "-OutputPath", str(events_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            self._process_exit_monitor = process
+            self._process_exit_monitor_paths = {
+                "events": str(events_path),
+                "script": str(script_path),
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "pid": process.pid,
+            }
+        except Exception as exc:
+            self._process_exit_monitor_paths = {"error": str(exc)}
+
+    def _stop_process_exit_monitor(self):
+        process = self._process_exit_monitor
+        self._process_exit_monitor = None
+        if not process:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+            _, stderr = process.communicate(timeout=5)
+            if stderr:
+                self._process_exit_monitor_paths["stderr"] = stderr[-4000:]
+        except Exception as exc:
+            self._process_exit_monitor_paths["stop_error"] = str(exc)
 
     @staticmethod
     def _windows_extended_diagnostics():
@@ -1243,6 +1367,37 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                         dump_paths.append(str(copied))
             except Exception as dump_exc:
                 (folder / "dump-copy-error.txt").write_text(str(dump_exc), encoding="utf-8")
+        crashpad_index = []
+        if getattr(self, "deep_diagnostic_mode", False):
+            profile_path = active.get("profile_path")
+            if profile_path:
+                try:
+                    source_root = Path(profile_path) / "Crashpad"
+                    if source_root.is_dir():
+                        destination_root = folder / "crashpad"
+                        for source in source_root.rglob("*"):
+                            if not source.is_file() or source.stat().st_mtime < active["started_epoch"] - 60:
+                                continue
+                            relative = source.relative_to(source_root)
+                            crashpad_index.append(
+                                {
+                                    "source": str(source),
+                                    "relative_path": str(relative),
+                                    "size": source.stat().st_size,
+                                    "modified_at": time.strftime(
+                                        "%Y-%m-%d %H:%M:%S", time.localtime(source.stat().st_mtime)
+                                    ),
+                                }
+                            )
+                            # Crashpad dumps can contain OneBSS data. Keep a
+                            # local copy for investigation but never auto-upload it.
+                            target = destination_root / relative
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(source, target)
+                except Exception as crashpad_exc:
+                    (folder / "crashpad-copy-error.txt").write_text(
+                        str(crashpad_exc), encoding="utf-8"
+                    )
         screenshot_path = folder / "onebss-error.png"
         screenshot_error = ""
         try:
@@ -1272,6 +1427,8 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "screenshot_error": screenshot_error,
             "windows_dump_count": len(dump_paths),
             "windows_dumps": dump_paths,
+            "deep_diagnostic_mode": getattr(self, "deep_diagnostic_mode", False),
+            "crashpad_file_count": len(crashpad_index),
         }
         (folder / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1286,13 +1443,35 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             json.dumps(
                 {
                     "before_export": active.get("browser_processes_before", ""),
-                    "after_error": self._windows_browser_processes(),
+                    "after_error": self._windows_browser_processes(
+                        include_command_line=getattr(self, "deep_diagnostic_mode", False)
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
             ),
             encoding="utf-8",
         )
+        if getattr(self, "deep_diagnostic_mode", False):
+            (folder / "browser-launches.json").write_text(
+                json.dumps(active.get("browser_launches", []), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            (folder / "crashpad-report-index.json").write_text(
+                json.dumps(crashpad_index, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            monitor = dict(self._process_exit_monitor_paths)
+            events_path = Path(monitor.get("events", "")) if monitor.get("events") else None
+            if events_path and events_path.is_file():
+                shutil.copy2(events_path, folder / "browser-exit-events.jsonl")
+            (folder / "process-exit-monitor.json").write_text(
+                json.dumps(monitor, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            native_path = active.get("native_log_path")
+            if native_path and Path(native_path).is_file():
+                (folder / "chromium-native.log").write_text(
+                    self._read_file_tail(native_path), encoding="utf-8"
+                )
         (folder / "windows-extended-diagnostics.json").write_text(
             json.dumps(
                 {
@@ -1316,6 +1495,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 raise RuntimeError("Thiếu Playwright. Hãy cài requirements.txt trước.")
             DOWNLOADS.mkdir(exist_ok=True)
             with sync_playwright() as p:
+                self._start_process_exit_monitor()
                 ctx = self._launch_browser_context(p)
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 self.browser_context, self.browser_page = ctx, page
@@ -1389,6 +1569,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 self._send_workflow_error_alert(error_text)
                 self.after(0, lambda error_text=error_text: messagebox.showerror("ATS TXL", error_text))
         finally:
+            self._stop_process_exit_monitor()
             self.current_stage = "Đã dừng"
             self.after(0, self.progress.stop)
             self.after(0, self._release_keep_awake)
@@ -1494,7 +1675,32 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 f"{selected_profile.name}-{self.browser_backend}"
             )
         selected_profile.mkdir(parents=True, exist_ok=True)
-        return playwright.chromium.launch_persistent_context(str(selected_profile), **options)
+        self._browser_profile_path = selected_profile
+        self._browser_native_log_path = None
+        if getattr(self, "deep_diagnostic_mode", False) and sys.platform == "win32":
+            runtime = APP_DATA / DIAGNOSTICS_DIRNAME / "runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            native_log = runtime / (
+                f"chromium_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.log"
+            )
+            self._browser_native_log_path = native_log
+            options["args"] = [
+                "--enable-logging",
+                "--v=1",
+                f"--log-file={native_log}",
+            ]
+        context = playwright.chromium.launch_persistent_context(str(selected_profile), **options)
+        if getattr(self, "deep_diagnostic_mode", False):
+            self._browser_launches.append(
+                {
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "backend": self.browser_backend,
+                    "profile_path": str(selected_profile),
+                    "native_log_path": str(self._browser_native_log_path or ""),
+                    "processes": self._windows_browser_processes(include_command_line=True),
+                }
+            )
+        return context
 
     def _navigate_onebss(self, page):
         menu_name = "Kiểm soát viên - Kiểm soát tồn báo hỏng CNTT"
@@ -1840,6 +2046,12 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 return context, page, self._export_excel(page, context)
             except Exception as exc:
                 if isinstance(exc, OneBSSSessionExpiredError):
+                    raise
+                if getattr(self, "deep_diagnostic_mode", False):
+                    self.write_log(
+                        "BẢN TEST CHẨN ĐOÁN dừng ở lỗi đầu tiên; không mở lại "
+                        "trình duyệt để giữ nguyên bằng chứng."
+                    )
                     raise
                 if isinstance(exc, OneBSSSearchTimeoutError):
                     search_timeouts += 1

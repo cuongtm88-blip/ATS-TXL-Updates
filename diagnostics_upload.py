@@ -24,6 +24,11 @@ DEFAULT_FILES = (
     "windows-events.json",
     "windows-extended-diagnostics.json",
     "browser-processes.json",
+    "browser-launches.json",
+    "browser-exit-events.jsonl",
+    "process-exit-monitor.json",
+    "chromium-native.log",
+    "crashpad-report-index.json",
 )
 OPTIONAL_FILES = ("onebss-error.png", "playwright-trace.zip")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")

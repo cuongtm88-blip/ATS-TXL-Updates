@@ -29,6 +29,8 @@ UninstallDisplayName=ATS TXL
 Source: "{#MySourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 #ifdef DiagnosticBuild
+Source: "..\ATS-TXL.deep-diagnostic"; DestDir: "{app}"; Flags: ignoreversion
+
 [Dirs]
 Name: "C:\ATS-TXL-Dumps"
 
@@ -36,6 +38,11 @@ Name: "C:\ATS-TXL-Dumps"
 Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\chrome.exe"; ValueType: string; ValueName: "DumpFolder"; ValueData: "C:\ATS-TXL-Dumps"; Flags: uninsdeletevalue
 Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\chrome.exe"; ValueType: dword; ValueName: "DumpCount"; ValueData: "5"; Flags: uninsdeletevalue
 Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\chrome.exe"; ValueType: dword; ValueName: "DumpType"; ValueData: "2"; Flags: uninsdeletevalue
+#endif
+
+#ifndef DiagnosticBuild
+[InstallDelete]
+Type: files; Name: "{app}\ATS-TXL.deep-diagnostic"
 #endif
 
 [Icons]

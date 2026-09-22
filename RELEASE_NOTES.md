@@ -1,3 +1,12 @@
+## Nội dung cập nhật 1.1.10-diagnostic
+
+- Bản riêng để truy nguyên Chromium đóng bất thường; là GitHub prerelease, không tham gia kênh tự cập nhật của các máy đang vận hành.
+- Chỉ dùng Playwright Chromium và dừng ngay ở lỗi đầu tiên; không tự khởi động lại browser, đổi browser hay làm mới OneBSS để không làm mất hiện trường.
+- Ghi PID, tiến trình cha, command line, profile, bộ nhớ và handle của browser lúc khởi chạy và trước/sau lỗi.
+- Theo dõi `Win32_ProcessStopTrace` để lấy PID và ExitStatus khi `chrome.exe` kết thúc, kể cả khi Windows không tạo WER dump.
+- Bật native Chromium log theo từng lần khởi chạy; thu chỉ phần cuối log, chỉ mục Crashpad và sao chép Crashpad report cục bộ. Crashpad dump không tự upload.
+- Gói private GitHub bổ sung browser launch, process exit, native log và Crashpad index. Các dump/Crashpad có thể chứa dữ liệu OneBSS vẫn chỉ lưu tại máy test.
+
 ## Nội dung cập nhật 1.1.9-diagnostic
 
 - Gói upload GitHub tự động bao gồm thêm `windows-extended-diagnostics.json`.
