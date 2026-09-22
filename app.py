@@ -77,6 +77,10 @@ class OneBSSSessionExpiredError(RuntimeError):
     """OneBSS needs a fresh interactive login, including OTP if requested."""
 
 
+class OneBSSSearchTimeoutError(RuntimeError):
+    """OneBSS did not finish a search; never export a partial result."""
+
+
 def _load_settings():
     try:
         data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -1281,9 +1285,17 @@ class ATSApp(tk.Tk):
                 while not self.stop_requested:
                     if cycle > 1:
                         self.write_log(f"Bắt đầu chu kỳ tự động lần {cycle}.")
-                    ctx, page, excel = self._export_excel_with_recovery(
-                        p, ctx, page, cycle
-                    )
+                    try:
+                        ctx, page, excel = self._export_excel_with_recovery(
+                            p, ctx, page, cycle
+                        )
+                    except OneBSSSessionExpiredError as exc:
+                        # Keep this Playwright session and browser open while
+                        # the user logs in and completes OTP in the same tab.
+                        ctx = self.browser_context or ctx
+                        page = self.browser_page or page
+                        self._wait_for_reauthentication(page, exc)
+                        continue
                     self.browser_context, self.browser_page = ctx, page
                     self.current_stage = f"Chu kỳ {cycle}: xử lý dữ liệu và gửi Telegram"
                     self._process_and_send(excel)
@@ -1302,13 +1314,15 @@ class ATSApp(tk.Tk):
                 ctx.close()
                 self.browser_context, self.browser_page = None, None
         except Exception as exc:
-            self.write_log(f"LỖI: {exc}")
-            error_text = str(exc)
-            if self._last_diagnostic_path:
-                error_text += f"\nGói chẩn đoán: {self._last_diagnostic_path}"
-            if not self.stop_requested:
+            if self.stop_requested:
+                self.write_log("Đã dừng quy trình theo yêu cầu.")
+            else:
+                self.write_log(f"LỖI: {exc}")
+                error_text = str(exc)
+                if self._last_diagnostic_path:
+                    error_text += f"\nGói chẩn đoán: {self._last_diagnostic_path}"
                 self._send_workflow_error_alert(error_text)
-            self.after(0, lambda error_text=error_text: messagebox.showerror("ATS TXL", error_text))
+                self.after(0, lambda error_text=error_text: messagebox.showerror("ATS TXL", error_text))
         finally:
             self.current_stage = "Đã dừng"
             self.after(0, self.progress.stop)
@@ -1320,28 +1334,19 @@ class ATSApp(tk.Tk):
         url = page.url.lower()
         if any(marker in url for marker in ("login", "signin", "auth")):
             return True
-        # OneBSS can leave the inventory screen visible after its access JWT
-        # expires. Only return an expiry time: never copy the token into Python,
-        # a log, or a diagnostic upload.
+        # OneBSS stores its access JWT in localStorage['OneBSS-Token'] and can
+        # leave the inventory screen visible after expiry. Return only its exp;
+        # never copy the token into Python, logs, or diagnostic uploads.
         try:
             expires_at = page.evaluate("""() => {
-                const expiries = [];
-                for (const storage of [window.localStorage, window.sessionStorage]) {
-                    for (let i = 0; i < storage.length; i++) {
-                        const value = storage.getItem(storage.key(i)) || '';
-                        if (value.length > 200000) continue;
-                        for (const match of value.matchAll(/eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+/g)) {
-                            try {
-                                const payload = match[0].split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-                                const claims = JSON.parse(atob(payload));
-                                if (typeof claims.exp === 'number' && claims.client_id && claims.scope) {
-                                    expiries.push(claims.exp);
-                                }
-                            } catch (_) {}
-                        }
-                    }
-                }
-                return expiries.length ? Math.max(...expiries) : null;
+                try {
+                    const stored = JSON.parse(localStorage.getItem('OneBSS-Token') || 'null');
+                    const token = stored && stored.access_token;
+                    if (!token || typeof token !== 'string') return 0;
+                    const payload = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+                    const claims = JSON.parse(atob(payload));
+                    return typeof claims.exp === 'number' ? claims.exp : 0;
+                } catch (_) { return 0; }
             }""")
             if expires_at is not None and float(expires_at) <= time.time() + 30:
                 return True
@@ -1363,9 +1368,37 @@ class ATSApp(tk.Tk):
         if self._onebss_session_expired(page):
             raise OneBSSSessionExpiredError(
                 "Phiên đăng nhập OneBSS đã hết hạn. Hãy đăng nhập và nhập OTP lại "
-                "ở bước 1, sau đó bấm bước 2. Chương trình không tự xuất Excel "
+                "trong trình duyệt đang mở, sau đó bấm bước 2. Chương trình không tự xuất Excel "
                 "khi phiên xác thực không còn hiệu lực."
             )
+
+    def _wait_for_reauthentication(self, page, reason):
+        """Pause without closing Playwright until OTP is completed in this tab."""
+        self.current_stage = "Chờ đăng nhập lại OneBSS"
+        self.start_event.clear()
+        self.write_log(
+            "Phiên OneBSS đã hết hạn; giữ trình duyệt mở. "
+            "Nếu trang vẫn hiện danh sách, hãy đăng xuất OneBSS, đăng nhập/nhập OTP "
+            "trong trình duyệt rồi bấm nút 2 để tiếp tục."
+        )
+        self._send_workflow_error_alert(str(reason))
+        while not self.stop_requested:
+            if not self.start_event.wait(timeout=1):
+                continue
+            self.start_event.clear()
+            if page.is_closed():
+                raise RuntimeError("Trình duyệt đã bị đóng trong lúc chờ đăng nhập lại.")
+            try:
+                self._ensure_onebss_session_active(page)
+                self.current_stage = "Cấu hình lại OneBSS sau đăng nhập"
+                self._navigate_onebss(page)
+                self._ensure_onebss_session_active(page)
+                self.write_log("Đăng nhập lại thành công; tiếp tục chu kỳ đang dở.")
+                return
+            except OneBSSSessionExpiredError:
+                self.write_log("OneBSS vẫn chưa xác thực xong; hãy hoàn tất OTP rồi bấm lại nút 2.")
+            except Exception as exc:
+                self.write_log(f"Chưa cấu hình lại được OneBSS: {exc}. Hãy bấm lại nút 2 sau khi trang sẵn sàng.")
 
     def _launch_browser_context(
         self,
@@ -1616,6 +1649,47 @@ class ATSApp(tk.Tk):
         self._ensure_onebss_session_active(page)
         self.write_log("Đã phục hồi OneBSS; chạy lại tìm kiếm và xuất Excel.")
 
+    def _wait_before_search_retry(self, page, seconds):
+        """Back off without freezing Stop or ignoring an expiring OneBSS token."""
+        deadline = time.monotonic() + seconds
+        next_session_check = 0
+        while time.monotonic() < deadline:
+            if self.stop_requested:
+                raise RuntimeError("Đã dừng bởi người dùng")
+            if page.is_closed():
+                raise RuntimeError("Trình duyệt đã đóng trong lúc chờ thử lại.")
+            if time.monotonic() >= next_session_check:
+                self._ensure_onebss_session_active(page)
+                next_session_check = time.monotonic() + 5
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+
+    def _recover_onebss_after_search_timeout(self, page, cycle, attempt):
+        """Reload and reconfigure in the same browser until OneBSS is ready."""
+        self.current_stage = f"Chu kỳ {cycle}: thử lại sau khi OneBSS tìm kiếm quá lâu"
+        while not self.stop_requested:
+            delay = min(30 * 2 ** min(attempt - 1, 4), 300)
+            self.write_log(
+                f"OneBSS chưa hoàn tất tìm kiếm; giữ trình duyệt mở, "
+                f"thử làm mới và cấu hình lại sau {delay} giây (lần {attempt})."
+            )
+            self._wait_before_search_retry(page, delay)
+            try:
+                self._ensure_onebss_session_active(page)
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+                self._ensure_onebss_session_active(page)
+                self._navigate_onebss(page)
+                self._ensure_onebss_session_active(page)
+                self.write_log("Đã làm mới OneBSS và cấu hình lại; tìm kiếm từ đầu.")
+                return
+            except OneBSSSessionExpiredError:
+                raise
+            except Exception as exc:
+                if page.is_closed() or self._is_browser_closed_error(exc):
+                    raise
+                self.write_log(f"OneBSS chưa sẵn sàng sau khi làm mới: {exc}")
+                attempt += 1
+        raise RuntimeError("Đã dừng bởi người dùng")
+
     @staticmethod
     def _is_browser_closed_error(exc):
         return isinstance(exc, TargetClosedError) or (
@@ -1675,6 +1749,7 @@ class ATSApp(tk.Tk):
     def _export_excel_with_recovery(self, playwright, context, page, cycle):
         """Run a complete cycle and recover from a browser disappearing at any stage."""
         recovery_attempt = 0
+        search_timeouts = 0
         while True:
             try:
                 # Browser shutdowns can race with the start of a scheduled
@@ -1689,6 +1764,29 @@ class ATSApp(tk.Tk):
             except Exception as exc:
                 if isinstance(exc, OneBSSSessionExpiredError):
                     raise
+                if isinstance(exc, OneBSSSearchTimeoutError):
+                    search_timeouts += 1
+                    if search_timeouts == 1:
+                        self._send_workflow_error_alert(
+                            "OneBSS tìm kiếm quá 10 phút; ATS TXL đang giữ trình duyệt mở "
+                            "và tự làm mới, cấu hình lại để thử tiếp. Chưa xuất Excel."
+                        )
+                    try:
+                        self._recover_onebss_after_search_timeout(
+                            page, cycle, search_timeouts
+                        )
+                    except OneBSSSessionExpiredError:
+                        raise
+                    except Exception as retry_exc:
+                        if not (self._is_browser_closed_error(retry_exc) or page.is_closed()):
+                            raise
+                        if recovery_attempt >= MAX_EXCEL_RECOVERY_ATTEMPTS:
+                            raise
+                        recovery_attempt += 1
+                        context, page, recovery_attempt = self._recover_closed_browser(
+                            playwright, context, cycle, recovery_attempt
+                        )
+                    continue
                 recover_download = isinstance(exc, PlaywrightTimeoutError) and (
                     self._is_excel_download_timeout(exc)
                 )
@@ -1753,8 +1851,10 @@ class ATSApp(tk.Tk):
             page.wait_for_timeout(500)
 
         if not processing_seen:
-            raise RuntimeError("OneBSS không bắt đầu xử lý sau khi bấm Tìm kiếm.")
-        raise RuntimeError(
+            raise OneBSSSearchTimeoutError(
+                "OneBSS không bắt đầu xử lý sau khi bấm Tìm kiếm; chưa xuất Excel."
+            )
+        raise OneBSSSearchTimeoutError(
             f"OneBSS chưa xử lý xong sau {timeout_seconds // 60} phút; chưa xuất Excel để tránh thiếu bản ghi."
         )
 

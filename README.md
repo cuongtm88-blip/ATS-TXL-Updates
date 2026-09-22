@@ -93,9 +93,11 @@ vậy việc cập nhật không làm mất cấu hình. GitHub token chẩn đo
 Windows Credential Manager, không ghi vào `settings.json`.
 
 Từ bản 1.1.3, Windows dùng hồ sơ Chromium mới, tách biệt Chrome/Edge; lần đầu
-sau cập nhật cần đăng nhập OneBSS và nhập OTP lại. Khi OneBSS hết phiên, ứng dụng
-cảnh báo riêng và dừng xuất báo cáo cho tới khi người dùng xác thực lại; bật
-"Giữ máy thức" không kéo dài phiên đăng nhập của OneBSS.
+sau cập nhật cần đăng nhập OneBSS và nhập OTP lại. Từ bản 1.1.4, nếu tìm kiếm
+quá 10 phút, ứng dụng giữ browser mở, làm mới tab, cấu hình lại bộ lọc và thử
+lại với khoảng nghỉ tăng dần. Khi OneBSS hết phiên, ứng dụng báo riêng và giữ
+browser mở để người dùng đăng nhập/OTP lại rồi bấm bước 2; không xuất báo cáo
+thiếu bản ghi. Bật "Giữ máy thức" không kéo dài phiên đăng nhập của OneBSS.
 
 Mỗi lần phát hành bản mới trên máy Windows dùng để build:
 

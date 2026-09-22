@@ -1,3 +1,10 @@
+## Nội dung cập nhật 1.1.4
+
+- Khi OneBSS tìm kiếm quá 10 phút hoặc không bắt đầu xử lý, ATS TXL không xuất Excel thiếu bản ghi và không kết thúc Playwright/đóng trình duyệt. Ứng dụng chờ 30 giây, làm mới tab hiện tại, cấu hình lại toàn bộ bộ lọc và thử tìm kiếm từ đầu; các lần thất bại sau tăng khoảng nghỉ đến tối đa 5 phút, tiếp tục cho tới khi thành công hoặc người dùng bấm Dừng.
+- Nếu làm mới/cấu hình lại gặp lỗi mạng tạm thời, ATS TXL tiếp tục thử trong cùng browser. Nếu chính browser bị đóng từ bên ngoài, cơ chế phục hồi browser hiện có mới được sử dụng.
+- Đọc đúng access token `OneBSS-Token` mà giao diện OneBSS dùng, không nhầm với refresh token. Khi token hết hạn, ứng dụng giữ browser mở, báo riêng qua Telegram và chờ người dùng đăng nhập/OTP lại rồi bấm bước 2; không tự lặp lại tìm kiếm bằng phiên đã hết hạn.
+- Chỉ gửi cảnh báo riêng một lần cho chuỗi lỗi tìm kiếm kéo dài của một chu kỳ, tránh làm đầy Telegram; vẫn lưu chẩn đoán từng lần lỗi.
+
 ## Nội dung cập nhật 1.1.3
 
 - Giữ Chromium tích hợp làm trình duyệt mặc định trên Windows; tạm dừng chuyển tự động sang Chrome/Edge. Khi trình duyệt bị đóng, ứng dụng chỉ thử mở lại cùng loại tối đa 3 lần và giữ nguyên bước đăng nhập/OTP nếu phiên đã hết hạn.
