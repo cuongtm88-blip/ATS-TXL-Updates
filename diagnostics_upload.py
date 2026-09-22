@@ -27,7 +27,6 @@ DEFAULT_FILES = (
     "browser-launches.json",
     "browser-exit-events.jsonl",
     "process-exit-monitor.json",
-    "chromium-native.log",
     "crashpad-report-index.json",
 )
 OPTIONAL_FILES = ("onebss-error.png", "playwright-trace.zip")

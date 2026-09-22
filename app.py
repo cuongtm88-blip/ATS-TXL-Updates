@@ -79,6 +79,10 @@ DIAGNOSTICS_DIRNAME = "diagnostics"
 DIAGNOSTICS_SECRET_SERVICE = "ATS-TXL"
 DIAGNOSTICS_SECRET_NAME = "github-diagnostics-token"
 DEFAULT_DIAGNOSTICS_REPOSITORY = "cuongtm88-blip/ATS-TXL-Diagnostics"
+DIAGNOSTIC_BROWSER_CHOICES = {
+    "Chromium tích hợp (Playwright)": None,
+    "Google Chrome cài sẵn": "chrome",
+}
 
 
 class OneBSSSessionExpiredError(RuntimeError):
@@ -206,6 +210,12 @@ class ATSApp(tk.Tk):
         self.browser_page = None
         self.browser_backend = "playwright-chromium"
         self.deep_diagnostic_mode = DEEP_DIAGNOSTIC_MODE
+        saved_diagnostic_browser = saved.get(
+            "diagnostic_browser_choice", "Chromium tích hợp (Playwright)"
+        )
+        if saved_diagnostic_browser not in DIAGNOSTIC_BROWSER_CHOICES:
+            saved_diagnostic_browser = "Chromium tích hợp (Playwright)"
+        self.diagnostic_browser_choice = tk.StringVar(value=saved_diagnostic_browser)
         self._browser_launches = []
         self._browser_profile_path = None
         self._browser_native_log_path = None
@@ -227,8 +237,8 @@ class ATSApp(tk.Tk):
         if self.deep_diagnostic_mode:
             self.update_btn.configure(state="disabled", text="Bản test chẩn đoán")
             self.write_log(
-                "BẢN TEST CHẨN ĐOÁN: chỉ dùng Chromium; dừng tại lỗi đầu tiên, "
-                "không tự phục hồi hoặc tự cập nhật."
+                "BẢN TEST CHẨN ĐOÁN: chọn một browser để kiểm chứng; dừng tại lỗi "
+                "đầu tiên, không tự phục hồi hoặc tự cập nhật."
             )
         elif updater.can_self_update():
             self.after(2500, self._automatic_update_tick)
@@ -322,6 +332,21 @@ class ATSApp(tk.Tk):
             diagnostics_box,
             text="Token chỉ lưu trong Windows Credential Manager/Keychain; không ghi vào settings.json hay GitHub public.",
         ).grid(row=3, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
+        if self.deep_diagnostic_mode:
+            ttk.Label(diagnostics_box, text="Browser A/B test").grid(
+                row=4, column=0, sticky="w", **pad
+            )
+            ttk.Combobox(
+                diagnostics_box,
+                textvariable=self.diagnostic_browser_choice,
+                values=tuple(DIAGNOSTIC_BROWSER_CHOICES),
+                state="readonly",
+                width=30,
+            ).grid(row=4, column=1, columnspan=2, sticky="w", **pad)
+            ttk.Label(
+                diagnostics_box,
+                text="Mỗi lần chỉ chạy một browser; phải đăng nhập/OTP lại khi đổi browser.",
+            ).grid(row=5, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
         diagnostics_box.columnconfigure(2, weight=1)
 
         actions = ttk.Frame(self)
@@ -689,6 +714,7 @@ class ATSApp(tk.Tk):
                 "schedule_enabled": self.auto_repeat,
                 "repeat_minutes": interval_minutes,
                 "keep_awake_enabled": bool(self.keep_awake_enabled.get()),
+                "diagnostic_browser_choice": self.diagnostic_browser_choice.get(),
             })
             self._apply_diagnostics_config(settings)
             _save_settings(settings)
@@ -1662,7 +1688,12 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "viewport": {"width": 1440, "height": 900},
         }
         if browser_channel is None and use_configured_channel:
-            browser_channel = os.getenv("ATS_BROWSER_CHANNEL", "").strip() or None
+            if getattr(self, "deep_diagnostic_mode", False):
+                browser_channel = DIAGNOSTIC_BROWSER_CHOICES.get(
+                    self.diagnostic_browser_choice.get(), None
+                )
+            else:
+                browser_channel = os.getenv("ATS_BROWSER_CHANNEL", "").strip() or None
         if browser_channel:
             options["channel"] = browser_channel
         self.browser_backend = browser_channel or "playwright-chromium"

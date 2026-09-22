@@ -1,3 +1,17 @@
+## Nội dung cập nhật 1.1.11-diagnostic
+
+- Bản test xác minh nguyên nhân Chromium crash tại lúc Xuất Excel; không phải
+  bản vận hành chính thức và không tham gia tự cập nhật.
+- Có lựa chọn A/B trong giao diện test: **Chromium tích hợp (Playwright)** hoặc
+  **Google Chrome cài sẵn**. Mỗi lần chỉ dùng một browser, dừng tại lỗi đầu
+  tiên, không đổi browser hoặc tự phục hồi. Khi đổi browser, người dùng phải
+  đăng nhập OneBSS/OTP lại trong hồ sơ browser tương ứng.
+- Playwright đang ở `1.63.0`, bản phát hành ổn định mới nhất tại thời điểm build;
+  do đó bản này không tuyên bố nâng Chromium mà dùng đối chứng Chrome để cô lập
+  nguyên nhân.
+- `chromium-native.log` vẫn chỉ lưu cục bộ khi cần đối chiếu, nhưng đã bị loại
+  khỏi mọi gói tự gửi lên GitHub vì có thể chứa dữ liệu OneBSS nhạy cảm.
+
 ## Nội dung cập nhật 1.1.10-diagnostic
 
 - Bản riêng để truy nguyên Chromium đóng bất thường; là GitHub prerelease, không tham gia kênh tự cập nhật của các máy đang vận hành.

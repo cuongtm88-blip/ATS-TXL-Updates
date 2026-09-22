@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import app
+import diagnostics_upload
 
 
 class RecoveryTests(unittest.TestCase):
@@ -326,6 +327,24 @@ class RecoveryTests(unittest.TestCase):
         message = state._active_export_diagnostic["events"][0]["message"]
         self.assertNotIn("header.payload.signature", message)
         self.assertIn("[REDACTED]", message)
+
+    def test_diagnostic_upload_never_includes_native_chromium_log(self):
+        self.assertNotIn("chromium-native.log", diagnostics_upload.DEFAULT_FILES)
+
+    def test_deep_diagnostic_can_select_installed_chrome_for_ab_test(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            browser = Mock()
+            state = SimpleNamespace(
+                browser_backend="",
+                deep_diagnostic_mode=True,
+                diagnostic_browser_choice=SimpleNamespace(get=lambda: "Google Chrome cài sẵn"),
+                _browser_launches=[],
+                _windows_browser_processes=Mock(return_value=[]),
+            )
+            with patch.object(app.sys, "platform", "win32"):
+                app.ATSApp._launch_browser_context(state, browser, profile=Path(temporary) / "profile")
+            options = browser.chromium.launch_persistent_context.call_args.kwargs
+            self.assertEqual(options["channel"], "chrome")
 
 
 if __name__ == "__main__":
