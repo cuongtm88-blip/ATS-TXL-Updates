@@ -1073,6 +1073,7 @@ class ATSApp(tk.Tk):
             "events": [],
             "trace_started": False,
             "browser_processes_before": self._windows_browser_processes(),
+            "windows_extended_before": self._windows_extended_diagnostics(),
         }
         self._attach_context_diagnostics(context, page)
         try:
@@ -1119,8 +1120,9 @@ class ATSApp(tk.Tk):
         if sys.platform != "win32":
             return "Không áp dụng: không phải Windows."
         command = (
-            "Get-Process chrome,msedge,chromium -ErrorAction SilentlyContinue | "
-            "Select-Object Id,ProcessName,Path,StartTime,CPU,WorkingSet64 | "
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='chromium.exe' OR Name='msedge.exe'\" "
+            "-ErrorAction SilentlyContinue | "
+            "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate | "
             "ConvertTo-Json -Depth 3"
         )
         try:
@@ -1135,6 +1137,41 @@ class ATSApp(tk.Tk):
             return result.stdout.strip() or result.stderr.strip() or "Không có browser process phù hợp."
         except Exception as exc:
             return f"Không đọc được browser process: {exc}"
+
+    @staticmethod
+    def _windows_extended_diagnostics():
+        """Collect Windows evidence that may explain an unexpected browser exit."""
+        if sys.platform != "win32":
+            return {"platform": "non-Windows", "note": "Không áp dụng."}
+        command = r'''
+$since=(Get-Date).AddMinutes(-15)
+$terms='chrome|chromium|playwright|ATS-TXL|Application Error|Windows Error Reporting|WerFault|Defender|AppLocker|blocked|terminated|crash'
+$logs=@('Application','System','Security','Microsoft-Windows-WER-Diag/Operational','Microsoft-Windows-Windows Defender/Operational','Microsoft-Windows-AppLocker/EXE and DLL')
+$events=@()
+foreach($log in $logs) {
+  try { $events += @(Get-WinEvent -FilterHashtable @{LogName=$log;StartTime=$since} -MaxEvents 300 -ErrorAction Stop | Where-Object { $_.ProviderName -match $terms -or $_.Message -match $terms } | Select-Object TimeCreated,LogName,ProviderName,Id,LevelDisplayName,Message) } catch { }
+}
+$reliability=@()
+try { $reliability=@(Get-CimInstance Win32_ReliabilityRecords -ErrorAction Stop | Where-Object { $_.TimeGenerated -and ([Management.ManagementDateTimeConverter]::ToDateTime($_.TimeGenerated) -ge $since) -and ($_.ProductName -match $terms -or $_.Message -match $terms) } | Select-Object TimeGenerated,SourceName,ProductName,EventIdentifier,Message) } catch { }
+$wer=@()
+foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:ProgramData\Microsoft\Windows\WER\ReportQueue")) { if(Test-Path $root) { $wer += @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since -and $_.Name -match $terms } | Select-Object FullName,Name,LastWriteTime) } }
+[pscustomobject]@{collected_at=(Get-Date).ToString('o'); since=$since; events=$events; reliability=$reliability; wer_reports=$wer} | ConvertTo-Json -Depth 6
+'''
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True, text=True, timeout=45, check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            output = result.stdout.strip()
+            if not output:
+                return {"error": result.stderr.strip() or "Không có dữ liệu."}
+            try:
+                return json.loads(output)
+            except json.JSONDecodeError:
+                return {"error": "Windows diagnostics không trả về JSON hợp lệ.", "raw_tail": output[-4000:]}
+        except Exception as exc:
+            return {"error": f"Không đọc được chẩn đoán Windows mở rộng: {exc}"}
 
     def _queue_diagnostic_upload(self, folder):
         config = self._diagnostics_upload_config
@@ -1233,6 +1270,17 @@ class ATSApp(tk.Tk):
                 {
                     "before_export": active.get("browser_processes_before", ""),
                     "after_error": self._windows_browser_processes(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        (folder / "windows-extended-diagnostics.json").write_text(
+            json.dumps(
+                {
+                    "before_export": active.get("windows_extended_before", {}),
+                    "after_error": self._windows_extended_diagnostics(),
                 },
                 ensure_ascii=False,
                 indent=2,

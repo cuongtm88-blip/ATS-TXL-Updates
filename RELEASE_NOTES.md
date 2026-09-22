@@ -1,3 +1,10 @@
+## Nội dung cập nhật 1.1.6
+
+- Mở rộng gói chẩn đoán Windows khi browser đóng: đọc thêm Application, System, Security, Windows Error Reporting, Defender, AppLocker, Reliability Monitor và các thư mục WER gần thời điểm lỗi.
+- Bổ sung dữ liệu trước/sau lỗi để đối chiếu tiến trình Chromium/Playwright biến mất.
+- Không bật crash dump hoặc thay đổi Registry tự động; ứng dụng chỉ đọc dữ liệu chẩn đoán hiện có, không cần quyền quản trị và không thay đổi chính sách Windows.
+- Bản này tập trung thu thập bằng chứng, không thay đổi browser backend hay cơ chế phục hồi.
+
 ## Nội dung cập nhật 1.1.5
 
 - Gửi cảnh báo Telegram riêng ngay khi Chromium/OneBSS đóng ngoài dự kiến và ATS TXL bắt đầu tự phục hồi, kể cả khi chu kỳ cuối cùng vẫn thành công. Cảnh báo ghi rõ số lần phục hồi và tên gói chẩn đoán; mỗi lần browser đóng sẽ có một cảnh báo.
