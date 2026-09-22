@@ -79,7 +79,10 @@ class RecoveryTests(unittest.TestCase):
         new_context = Mock(pages=[new_page])
         state = SimpleNamespace(
             browser_backend="playwright-chromium",
+            current_stage="Chu kỳ 2: tìm kiếm và xuất Excel",
+            _last_diagnostic_path=Path("export_20260922_134341_1dfafa0945"),
             write_log=Mock(),
+            _send_workflow_error_alert=Mock(),
             _launch_browser_context=Mock(return_value=new_context),
             _ensure_onebss_session_active=Mock(),
             _navigate_onebss=Mock(),
@@ -87,6 +90,9 @@ class RecoveryTests(unittest.TestCase):
         result = app.ATSApp._recover_closed_browser(state, Mock(), old_context, 2, 1)
         self.assertEqual(result, (new_context, new_page, 1))
         self.assertIsNone(state._launch_browser_context.call_args.kwargs["browser_channel"])
+        alert = state._send_workflow_error_alert.call_args.args[0]
+        self.assertIn("đang tự phục hồi lần 1/3", alert)
+        self.assertIn("export_20260922_134341_1dfafa0945", alert)
         old_context.close.assert_called_once()
 
     def test_recovery_does_not_retry_when_otp_is_needed(self):
@@ -94,7 +100,9 @@ class RecoveryTests(unittest.TestCase):
         new_context = Mock(pages=[Mock()])
         state = SimpleNamespace(
             browser_backend="playwright-chromium",
+            current_stage="Chu kỳ 2: tìm kiếm và xuất Excel",
             write_log=Mock(),
+            _send_workflow_error_alert=Mock(),
             _launch_browser_context=Mock(return_value=new_context),
             _ensure_onebss_session_active=Mock(side_effect=app.OneBSSSessionExpiredError("expired")),
             _navigate_onebss=Mock(),
@@ -102,6 +110,26 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaises(app.OneBSSSessionExpiredError):
             app.ATSApp._recover_closed_browser(state, Mock(), old_context, 2, 1)
         state._launch_browser_context.assert_called_once()
+
+    def test_telegram_failure_does_not_block_browser_recovery(self):
+        old_context = Mock()
+        new_page = Mock()
+        new_context = Mock(pages=[new_page])
+        state = SimpleNamespace(
+            browser_backend="playwright-chromium",
+            current_stage="Chu kỳ 1: tìm kiếm và xuất Excel",
+            write_log=Mock(),
+            _send_workflow_error_alert=Mock(side_effect=RuntimeError("Telegram offline")),
+            _launch_browser_context=Mock(return_value=new_context),
+            _ensure_onebss_session_active=Mock(),
+            _navigate_onebss=Mock(),
+        )
+        result = app.ATSApp._recover_closed_browser(state, Mock(), old_context, 1, 1)
+        self.assertEqual(result, (new_context, new_page, 1))
+        state._send_workflow_error_alert.assert_called_once()
+        state.write_log.assert_any_call(
+            "Không gửi được cảnh báo browser bị đóng: Telegram offline"
+        )
 
     def test_search_timeout_retries_without_closing_context(self):
         context = Mock()

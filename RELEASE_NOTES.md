@@ -1,3 +1,9 @@
+## Nội dung cập nhật 1.1.5
+
+- Gửi cảnh báo Telegram riêng ngay khi Chromium/OneBSS đóng ngoài dự kiến và ATS TXL bắt đầu tự phục hồi, kể cả khi chu kỳ cuối cùng vẫn thành công. Cảnh báo ghi rõ số lần phục hồi và tên gói chẩn đoán; mỗi lần browser đóng sẽ có một cảnh báo.
+- Việc gửi cảnh báo thất bại không cản trở mở lại trình duyệt. Gói chẩn đoán vẫn được lưu/gửi riêng như trước.
+- Hai gói chẩn đoán 22/09/2026 cho thấy toàn bộ tiến trình Chromium tích hợp của ATS TXL biến mất lúc Xuất Excel; Windows Application Event Log không có sự kiện crash phù hợp. Bản này sửa điểm thiếu cảnh báo, chưa khẳng định hay sửa được nguyên nhân hệ điều hành/trình duyệt đóng tiến trình.
+
 ## Nội dung cập nhật 1.1.4
 
 - Khi OneBSS tìm kiếm quá 10 phút hoặc không bắt đầu xử lý, ATS TXL không xuất Excel thiếu bản ghi và không kết thúc Playwright/đóng trình duyệt. Ứng dụng chờ 30 giây, làm mới tab hiện tại, cấu hình lại toàn bộ bộ lọc và thử tìm kiếm từ đầu; các lần thất bại sau tăng khoảng nghỉ đến tối đa 5 phút, tiếp tục cho tới khi thành công hoặc người dùng bấm Dừng.

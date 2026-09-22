@@ -1700,12 +1700,24 @@ class ATSApp(tk.Tk):
         self, playwright, context, cycle, recovery_attempt
     ):
         """Restart only the current browser with its own persistent profile."""
+        failed_stage = self.current_stage
         self.current_stage = f"Chu kỳ {cycle}: phục hồi Chromium sau khi bị đóng"
         self.write_log(
             "Browser/OneBSS đã bị đóng trong chu kỳ. "
             f"Đang mở lại và cấu hình lại (lần {recovery_attempt}/"
             f"{MAX_EXCEL_RECOVERY_ATTEMPTS})..."
         )
+        diagnostic = getattr(self, "_last_diagnostic_path", None)
+        diagnostic_note = f" Gói chẩn đoán: {Path(diagnostic).name}." if diagnostic else ""
+        try:
+            self._send_workflow_error_alert(
+                f"Trình duyệt OneBSS đóng ngoài dự kiến tại {failed_stage}; "
+                f"đang tự phục hồi lần {recovery_attempt}/{MAX_EXCEL_RECOVERY_ATTEMPTS}."
+                f"{diagnostic_note}"
+            )
+        except Exception as alert_exc:
+            # A Telegram outage must not prevent browser recovery.
+            self.write_log(f"Không gửi được cảnh báo browser bị đóng: {alert_exc}")
         try:
             context.close()
         except Exception:
