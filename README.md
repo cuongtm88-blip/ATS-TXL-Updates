@@ -38,6 +38,8 @@ mới. Trên ứng dụng, bấm `Lấy Chat ID`, chọn đúng tên Telegram, b
 dấu phẩy. Khi quy trình
 gặp lỗi, trình duyệt bị đóng hoặc phiên đăng nhập OneBSS hết hạn, bot sẽ gửi riêng
 thời gian, tên máy, hệ điều hành, giai đoạn và nội dung lỗi đến các Chat ID này.
+Từ bản 1.1.5, khi browser đóng nhưng ứng dụng tự phục hồi thành công, bot vẫn gửi
+cảnh báo ngay lúc bắt đầu phục hồi.
 Thao tác bấm `Dừng` chủ động không phát sinh cảnh báo lỗi.
 
 Các lỗi không được xử lý từ giao diện ứng dụng cũng được gửi theo cùng danh sách.
@@ -124,6 +126,9 @@ Chat ID, báo cáo Excel và Chrome profile bị loại trừ qua `.gitignore`.
 
 ## Lưu ý
 
+- Quy tắc phát hành: Không tự động sửa mã nguồn, build hoặc phát hành phiên bản
+  mới khi chưa có sự đồng ý rõ ràng của người dùng. Mọi thay đổi đề xuất phải
+  được trình bày trước; chỉ thực hiện sau khi người dùng xác nhận.
 - Không lưu tài khoản/mật khẩu OneBSS. Token Telegram được lưu cục bộ theo yêu
   cầu để tự điền ở lần mở sau.
 - Website có thể thay đổi tên/selector; nếu thay đổi, cần cập nhật các nhãn trong `app.py`.
