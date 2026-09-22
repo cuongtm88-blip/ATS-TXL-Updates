@@ -18,7 +18,13 @@ import requests
 
 GITHUB_API_VERSION = "2022-11-28"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-DEFAULT_FILES = ("summary.json", "browser-events.json", "windows-events.json", "browser-processes.json")
+DEFAULT_FILES = (
+    "summary.json",
+    "browser-events.json",
+    "windows-events.json",
+    "windows-extended-diagnostics.json",
+    "browser-processes.json",
+)
 OPTIONAL_FILES = ("onebss-error.png", "playwright-trace.zip")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 

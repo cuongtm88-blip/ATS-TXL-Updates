@@ -1,3 +1,9 @@
+## Nội dung cập nhật 1.1.9-diagnostic
+
+- Gói upload GitHub tự động bao gồm thêm `windows-extended-diagnostics.json`.
+- Crash dump đầy đủ vẫn giữ tại `C:\ATS-TXL-Dumps` và trong gói cục bộ; không tự upload vì GitHub Contents API giới hạn 25 MB và dump có thể chứa dữ liệu nhạy cảm.
+- Nếu cần phân tích sâu, gửi riêng dump sau khi kiểm tra quyền truy cập và nội dung.
+
 ## Nội dung cập nhật 1.1.8-diagnostic
 
 - Tự động phát hiện và sao chép Chromium crash dump mới từ `C:\ATS-TXL-Dumps` vào gói chẩn đoán lỗi.
