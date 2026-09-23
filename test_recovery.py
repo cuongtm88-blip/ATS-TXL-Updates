@@ -1,6 +1,7 @@
 """Regression tests for Windows browser recovery and OneBSS auth detection."""
 
 import io
+import json
 import tempfile
 import time
 import unittest
@@ -28,6 +29,173 @@ class RecoveryTests(unittest.TestCase):
         ambiguous = SimpleNamespace(url="https://onebss.vnpt.vn/api/queryRecords")
         self.assertTrue(app.ATSApp._is_explicit_export_candidate(export))
         self.assertFalse(app.ATSApp._is_explicit_export_candidate(ambiguous))
+
+    def test_test_c_finds_root_browser_pid_for_ats_profile(self):
+        snapshot = [
+            {
+                "ProcessId": 10,
+                "Name": "chrome.exe",
+                "CommandLine": 'chrome.exe --user-data-dir="C:\\ATS\\profile"',
+            },
+            {
+                "ProcessId": 11,
+                "Name": "chrome.exe",
+                "CommandLine": 'chrome.exe --type=renderer --user-data-dir="C:\\ATS\\profile"',
+            },
+            {
+                "ProcessId": 12,
+                "Name": "msedge.exe",
+                "CommandLine": 'msedge.exe --user-data-dir="C:\\Edge\\profile"',
+            },
+        ]
+        root = app.ATSApp._find_main_browser_process(
+            json.dumps(snapshot), r"C:\ATS\profile"
+        )
+        self.assertEqual(root["pid"], 10)
+
+    def test_test_c_observation_waits_without_closing_browser_targets(self):
+        context = object()
+        active = {
+            "context": context,
+            "network_armed": True,
+            "main_browser_process": {"pid": 10},
+            "profile_path": "",
+            "events": [],
+            "network_events": [],
+        }
+        state = app.ATSApp.__new__(app.ATSApp)
+        state._active_export_diagnostic = active
+        state.write_log = Mock()
+        page = Mock()
+        page.is_closed.return_value = False
+        page.wait_for_timeout.side_effect = lambda timeout: time.sleep(timeout / 1000)
+        with (
+            patch.object(app.ATSApp, "_open_main_process_watch", return_value=object()),
+            patch.object(app.ATSApp, "_poll_main_process_watch", return_value={"alive": True}),
+            patch.object(app.ATSApp, "_close_main_process_watch"),
+            patch.object(app.ATSApp, "_snapshot_browser_dumps", return_value={}),
+        ):
+            result = state._observe_test_c(
+                page, context, active, duration_seconds=0.02
+            )
+        self.assertIn("Chrome remained alive", result)
+        page.close.assert_not_called()
+        self.assertFalse(active["test_c_observing"])
+        self.assertEqual(active["close_reason"], "application-cleanup")
+
+    def test_test_c_records_main_pid_exit_and_exit_code(self):
+        context = object()
+        active = {
+            "context": context,
+            "network_armed": True,
+            "main_browser_process": {"pid": 10},
+            "profile_path": "",
+            "events": [],
+            "network_events": [],
+        }
+        state = app.ATSApp.__new__(app.ATSApp)
+        state._active_export_diagnostic = active
+        state.write_log = Mock()
+        page = Mock()
+        page.is_closed.return_value = False
+        page.wait_for_timeout.side_effect = lambda timeout: time.sleep(timeout / 1000)
+        with (
+            patch.object(app.ATSApp, "_open_main_process_watch", return_value=object()),
+            patch.object(app.ATSApp, "_poll_main_process_watch", return_value={"alive": False, "exit_code": 7}),
+            patch.object(app.ATSApp, "_close_main_process_watch"),
+            patch.object(app.ATSApp, "_snapshot_browser_dumps", return_value={}),
+        ):
+            result = state._observe_test_c(
+                page, context, active, duration_seconds=0.02
+            )
+        self.assertIn("terminated independently", result)
+        self.assertEqual(active["close_reason"], "unexpected-browser-exit")
+        exited = [
+            event for event in active["network_events"]
+            if event["event_type"] == "MAIN CHROME PROCESS EXITED"
+        ]
+        self.assertEqual(exited[0]["exit_code"], 7)
+
+    def test_test_c_classifies_playwright_close_as_unexpected_even_if_main_pid_lives(self):
+        context = object()
+        active = {
+            "context": context,
+            "network_armed": True,
+            "main_browser_process": {"pid": 10},
+            "profile_path": "",
+            "events": [],
+            "network_events": [],
+        }
+        state = app.ATSApp.__new__(app.ATSApp)
+        state._active_export_diagnostic = active
+        state.write_log = Mock()
+        page = Mock()
+        page.is_closed.return_value = False
+
+        def close_context_during_observation(_timeout):
+            state._on_diagnostic_context_closed(context)
+            time.sleep(0.001)
+
+        page.wait_for_timeout.side_effect = close_context_during_observation
+        with (
+            patch.object(app.ATSApp, "_open_main_process_watch", return_value=object()),
+            patch.object(app.ATSApp, "_poll_main_process_watch", return_value={"alive": True}),
+            patch.object(app.ATSApp, "_close_main_process_watch"),
+            patch.object(app.ATSApp, "_snapshot_browser_dumps", return_value={}),
+        ):
+            result = state._observe_test_c(
+                page, context, active, duration_seconds=0.02
+            )
+        self.assertIn("observed browser/page/context closure", result)
+        self.assertEqual(active["close_reason"], "unexpected-browser-exit")
+
+    def test_test_c_closes_context_only_after_observation_and_cleanup_marker(self):
+        context = Mock()
+        sequence = []
+        context.close.side_effect = lambda: sequence.append("context.close")
+        active = {
+            "context": context,
+            "network_armed": True,
+            "download_event_seen": True,
+            "events": [],
+            "network_events": [],
+            "page_ids": {},
+            "main_browser_process": {"pid": 10},
+            "close_reason": "application-cleanup",
+        }
+        state = app.ATSApp.__new__(app.ATSApp)
+        state._active_export_diagnostic = active
+        state._diagnostic_upload_config = None
+        state._error_recipient_ids = []
+        state.write_log = Mock(side_effect=lambda line: sequence.append(line))
+        state._finish_export_diagnostic = Mock(
+            side_effect=lambda *args: sequence.append("finish diagnostics")
+        )
+        page = Mock()
+        page.is_closed.return_value = False
+        page.get_by_text.return_value.click.return_value = None
+        with (
+            patch.object(
+                app.ATSApp,
+                "_observe_test_c",
+                return_value="TEST C RESULT: Chrome remained alive for 30 seconds after Blob download.",
+            ) as observe,
+            self.assertRaises(app.DiagnosticTestCompleted),
+        ):
+            state._run_export_test_a(page, context)
+        observe.assert_called_once_with(page, context, active, duration_seconds=30)
+        self.assertLess(
+            sequence.index("DIAGNOSTIC CLEANUP STARTED"),
+            sequence.index("context.close"),
+        )
+        self.assertLess(
+            sequence.index("context.close"),
+            sequence.index("DIAGNOSTIC CLEANUP FINISHED"),
+        )
+        self.assertLess(
+            sequence.index("DIAGNOSTIC CLEANUP FINISHED"),
+            sequence.index("finish diagnostics"),
+        )
 
     def test_xlsx_response_is_recognized_by_ooxml_structure(self):
         stream = io.BytesIO()
@@ -380,6 +548,33 @@ class RecoveryTests(unittest.TestCase):
     def test_diagnostic_upload_never_includes_native_chromium_log(self):
         self.assertNotIn("chromium-native.log", diagnostics_upload.DEFAULT_FILES)
         self.assertIn("export-network-events.jsonl", diagnostics_upload.DEFAULT_FILES)
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "export"
+            folder.mkdir()
+            (folder / "chromium-native.log").write_text(
+                "raw console payload must stay local", encoding="utf-8"
+            )
+            archive_path, _ = diagnostics_upload._archive(folder)
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertNotIn("chromium-native.log", archive.namelist())
+
+    def test_diagnostic_console_events_do_not_store_message_text(self):
+        context = object()
+        secret = "Authorization: Bearer do-not-log-this"
+        active = {"context": context, "events": []}
+        state = app.ATSApp.__new__(app.ATSApp)
+        state._active_export_diagnostic = active
+        state._diagnostic_page_ids = set()
+        page = Mock()
+        page.url = "https://onebss.vnpt.vn/"
+        state._attach_page_diagnostics(context, page)
+        console_handler = next(
+            call.args[1] for call in page.on.call_args_list
+            if call.args[0] == "console"
+        )
+        console_handler(SimpleNamespace(type="warning", text=secret))
+        self.assertNotIn(secret, json.dumps(active["events"]))
+        self.assertNotIn("message", active["events"][0])
 
     def test_token_expiry_warning_is_sent_once_per_token(self):
         expiry = time.time() + 10 * 60

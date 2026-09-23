@@ -18,6 +18,7 @@ import requests
 
 GITHUB_API_VERSION = "2022-11-28"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+# Intentionally not allowlisted: the raw Chromium log can contain OneBSS console payloads.
 DEFAULT_FILES = (
     "summary.json",
     "browser-events.json",

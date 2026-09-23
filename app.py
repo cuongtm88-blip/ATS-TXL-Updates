@@ -1115,14 +1115,13 @@ class ATSApp(tk.Tk):
         )
         page.on(
             "close",
-            lambda: self._record_diagnostic_event(
-                context, "page-close", url=self._safe_page_url(page)
-            ),
+            lambda: self._on_diagnostic_page_closed(context, page),
         )
         page.on(
             "pageerror",
             lambda error: self._record_diagnostic_event(
-                context, "page-error", message=error, url=self._safe_page_url(page)
+                context, "page-error", error_type=type(error).__name__,
+                url=self._safe_page_url(page),
             ),
         )
 
@@ -1131,7 +1130,6 @@ class ATSApp(tk.Tk):
                 self._record_diagnostic_event(
                     context,
                     "console-" + message.type,
-                    message=message.text,
                     url=self._safe_page_url(page),
                 )
 
@@ -1141,25 +1139,18 @@ class ATSApp(tk.Tk):
             active = self._active_export_diagnostic
             if active and active.get("context") is context:
                 active["download_event_seen"] = True
+                active["download_event_monotonic"] = time.monotonic()
             self._record_diagnostic_event(
                 context,
                 "DOWNLOAD EVENT DETECTED",
-                suggested_filename=re.sub(
-                    r"(?i)([0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{20,}|[a-z0-9_-]{32,}|\d{6,})",
-                    "[REDACTED]",
-                    Path(download.suggested_filename).name,
-                )[:180],
+                file_extension=Path(download.suggested_filename).suffix.lower()[:12],
                 url=self._safe_diagnostic_url(download.url),
                 page_id=self._diagnostic_page_id(context, page),
             )
             self._record_network_event(
                 context,
                 event_type="DOWNLOAD EVENT DETECTED",
-                suggested_filename=re.sub(
-                    r"(?i)([0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{20,}|[a-z0-9_-]{32,}|\d{6,})",
-                    "[REDACTED]",
-                    Path(download.suggested_filename).name,
-                )[:180],
+                file_extension=Path(download.suggested_filename).suffix.lower()[:12],
                 url=self._safe_diagnostic_url(download.url),
                 page_id=self._diagnostic_page_id(context, page),
                 decision="observed",
@@ -1216,13 +1207,13 @@ class ATSApp(tk.Tk):
                     context,
                     "request-failed",
                     url=request.url,
-                    failure=request.failure,
+                    failure_observed=bool(request.failure),
                 ),
             )
             context.on(
                 "weberror",
                 lambda error: self._record_diagnostic_event(
-                    context, "web-error", message=error.error
+                    context, "web-error", error_type=type(error.error).__name__
                 ),
             )
             try:
@@ -1249,6 +1240,8 @@ class ATSApp(tk.Tk):
         active = self._active_export_diagnostic
         if active and active.get("context") is context:
             active["browser_disconnected"] = True
+            if active.get("test_c_observing"):
+                self._record_test_c_timeline(context, "BROWSER DISCONNECTED")
             if not active.get("download_event_seen"):
                 self._record_network_event(
                     context,
@@ -1262,6 +1255,10 @@ class ATSApp(tk.Tk):
         active = self._active_export_diagnostic
         if active and active.get("context") is context:
             active["page_crashed"] = True
+            if active.get("test_c_observing"):
+                self._record_test_c_timeline(
+                    context, "PAGE CRASH", page_id=self._diagnostic_page_id(context, page)
+                )
             if not active.get("download_event_seen"):
                 self._record_network_event(
                     context,
@@ -1272,10 +1269,21 @@ class ATSApp(tk.Tk):
                 )
         self._record_diagnostic_event(context, "page-crash", url=self._safe_page_url(page))
 
+    def _on_diagnostic_page_closed(self, context, page):
+        active = self._active_export_diagnostic
+        if active and active.get("context") is context and active.get("test_c_observing"):
+            active["page_closed"] = True
+            self._record_test_c_timeline(
+                context, "PAGE CLOSE", page_id=self._diagnostic_page_id(context, page)
+            )
+        self._record_diagnostic_event(context, "page-close", url=self._safe_page_url(page))
+
     def _on_diagnostic_context_closed(self, context):
         active = self._active_export_diagnostic
         if active and active.get("context") is context:
             active["context_closed"] = True
+            if active.get("test_c_observing"):
+                self._record_test_c_timeline(context, "CONTEXT CLOSE")
             if not active.get("download_event_seen"):
                 self._record_network_event(
                     context,
@@ -1284,6 +1292,18 @@ class ATSApp(tk.Tk):
                     decision="observed",
                 )
         self._record_diagnostic_event(context, "context-close")
+
+    def _record_test_c_timeline(self, context, event_type, **details):
+        active = self._active_export_diagnostic
+        if not active or active.get("context") is not context:
+            return
+        self._record_network_event(
+            context,
+            event_type=event_type,
+            decision="observed",
+            **details,
+        )
+        self._record_diagnostic_event(context, event_type, **details)
 
     def _record_network_event(self, context, **event):
         active = self._active_export_diagnostic
@@ -1351,7 +1371,283 @@ class ATSApp(tk.Tk):
             decision="observed",
         )
 
+    @staticmethod
+    def _find_main_browser_process(snapshot, profile_path):
+        """Find the browser root PID by its dedicated ATS-TXL profile, not process name alone."""
+        try:
+            processes = json.loads(snapshot) if isinstance(snapshot, str) else snapshot
+            if isinstance(processes, dict):
+                processes = [processes]
+            profile = os.path.normcase(str(profile_path or "").replace("/", "\\")).rstrip("\\")
+            if not profile or not isinstance(processes, list):
+                return None
+            for process in processes:
+                if not isinstance(process, dict):
+                    continue
+                command_line = str(process.get("CommandLine") or "").replace("/", "\\")
+                if profile not in os.path.normcase(command_line):
+                    continue
+                if re.search(r"(?:^|\s)--type=", command_line, re.IGNORECASE):
+                    continue
+                return {
+                    "pid": int(process["ProcessId"]),
+                    "process_name": str(process.get("Name") or ""),
+                    "created_at": str(process.get("CreationDate") or ""),
+                }
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            return None
+        return None
+
+    @staticmethod
+    def _open_main_process_watch(pid):
+        """Hold a Windows process handle so exit and exit code are checked for the exact root PID."""
+        if sys.platform != "win32" or not pid:
+            return None
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle_type = ctypes.c_void_p
+            dword_type = ctypes.c_ulong
+            kernel32.OpenProcess.argtypes = [dword_type, ctypes.c_int, dword_type]
+            kernel32.OpenProcess.restype = handle_type
+            kernel32.WaitForSingleObject.argtypes = [handle_type, dword_type]
+            kernel32.WaitForSingleObject.restype = dword_type
+            kernel32.GetExitCodeProcess.argtypes = [handle_type, ctypes.POINTER(dword_type)]
+            kernel32.GetExitCodeProcess.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = [handle_type]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            access = 0x00100000 | 0x1000  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+            handle = kernel32.OpenProcess(access, False, int(pid))
+            if not handle:
+                return None
+            return {"kernel32": kernel32, "handle": handle, "pid": int(pid)}
+        except Exception:
+            return None
+
+    @staticmethod
+    def _poll_main_process_watch(watch):
+        if not watch:
+            return None
+        try:
+            import ctypes
+
+            kernel32 = watch["kernel32"]
+            result = int(kernel32.WaitForSingleObject(watch["handle"], 0))
+            if result == 0x00000102:  # WAIT_TIMEOUT: process is still running.
+                return {"alive": True, "exit_code": None}
+            if result != 0:  # WAIT_FAILED or an unexpected wait result.
+                return None
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(watch["handle"], ctypes.byref(exit_code)):
+                return {"alive": False, "exit_code": None}
+            return {"alive": False, "exit_code": int(exit_code.value)}
+        except Exception:
+            return None
+
+    @staticmethod
+    def _close_main_process_watch(watch):
+        if not watch:
+            return
+        try:
+            watch["kernel32"].CloseHandle(watch["handle"])
+        except Exception:
+            pass
+
+    @staticmethod
+    def _snapshot_browser_dumps(profile_path):
+        """Return metadata only for new local-dump, Crashpad, and Chrome WER artifacts."""
+        if sys.platform != "win32":
+            return {}
+        roots = [
+            (Path(r"C:\ATS-TXL-Dumps"), "Windows LocalDumps", False),
+            (Path(profile_path) / "Crashpad", "Crashpad", True),
+        ]
+        found = {}
+        for root, source, recursive in roots:
+            try:
+                if not root.is_dir():
+                    continue
+                files = root.rglob("*.dmp") if recursive else root.glob("*.dmp")
+                for path in files:
+                    try:
+                        stat = path.stat()
+                        found[str(path).casefold()] = {
+                            "source": source,
+                            "size": stat.st_size,
+                            "mtime_ns": stat.st_mtime_ns,
+                        }
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+        program_data = os.environ.get("ProgramData")
+        if program_data:
+            for wer_name in ("ReportArchive", "ReportQueue"):
+                wer_root = (
+                    Path(program_data) / "Microsoft" / "Windows" / "WER" / wer_name
+                )
+                try:
+                    reports = tuple(wer_root.iterdir())
+                except OSError:
+                    continue
+                for report in reports:
+                    if not report.is_dir() or not re.search(
+                        r"appcrash.*chrome\.exe", report.name, re.IGNORECASE
+                    ):
+                        continue
+                    try:
+                        stat = report.stat()
+                        found[str(report).casefold()] = {
+                            "source": "Windows WER",
+                            "size": 0,
+                            "mtime_ns": stat.st_mtime_ns,
+                        }
+                        for path in report.rglob("*.dmp"):
+                            try:
+                                stat = path.stat()
+                                found[str(path).casefold()] = {
+                                    "source": "Windows WER",
+                                    "size": stat.st_size,
+                                    "mtime_ns": stat.st_mtime_ns,
+                                }
+                            except OSError:
+                                continue
+                    except OSError:
+                        continue
+        return found
+
+    def _observe_test_c(self, page, context, active, duration_seconds=30):
+        """Observe the browser after a Blob download without touching Download or closing targets."""
+        pid_info = active.get("main_browser_process") or {}
+        pid = pid_info.get("pid")
+        watch = self._open_main_process_watch(pid)
+        profile_path = active.get("profile_path") or ""
+        dumps_before = self._snapshot_browser_dumps(profile_path)
+        seen_dump_keys = set(dumps_before)
+        started = time.monotonic()
+        active["test_c_observing"] = True
+        self._record_test_c_timeline(
+            context,
+            "OBSERVATION WINDOW STARTED",
+            duration_seconds=duration_seconds,
+            main_chrome_pid=pid,
+            process_watch_available=bool(watch),
+        )
+        self.write_log("OBSERVATION WINDOW STARTED")
+        if not pid or not watch:
+            self._record_test_c_timeline(
+                context,
+                "MAIN CHROME PID UNAVAILABLE",
+                main_chrome_pid=pid,
+            )
+
+        process_exit = None
+        last_status = None
+        try:
+            while time.monotonic() - started < duration_seconds:
+                sample_started = time.monotonic()
+                try:
+                    if page.is_closed():
+                        raise RuntimeError("page closed")
+                    remaining = max(
+                        0.001,
+                        min(1.0, duration_seconds - (time.monotonic() - started)),
+                    )
+                    page.wait_for_timeout(max(1, int(remaining * 1000)))
+                except Exception:
+                    remaining = 1.0 - (time.monotonic() - sample_started)
+                    if remaining > 0:
+                        time.sleep(remaining)
+
+                last_status = self._poll_main_process_watch(watch)
+                elapsed = min(duration_seconds, int(time.monotonic() - started))
+                self._record_test_c_timeline(
+                    context,
+                    "MAIN CHROME PROCESS STATUS",
+                    main_chrome_pid=pid,
+                    alive=last_status.get("alive") if last_status else None,
+                    elapsed_seconds=elapsed,
+                )
+                if last_status and not last_status["alive"] and process_exit is None:
+                    process_exit = last_status
+                    active["close_reason"] = "unexpected-browser-exit"
+                    exit_time = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                    self._record_test_c_timeline(
+                        context,
+                        "MAIN CHROME PROCESS EXITED",
+                        main_chrome_pid=pid,
+                        timestamp=exit_time,
+                        exit_code=last_status.get("exit_code"),
+                    )
+                    self.write_log(
+                        "MAIN CHROME PROCESS EXITED "
+                        f"{exit_time}; exit code={last_status.get('exit_code')}"
+                    )
+
+                dumps_now = self._snapshot_browser_dumps(profile_path)
+                new_dumps = [
+                    (key, item) for key, item in dumps_now.items()
+                    if key not in seen_dump_keys or item != dumps_before.get(key)
+                ]
+                for _, dump in new_dumps:
+                    self._record_test_c_timeline(
+                        context,
+                        "NEW CRASHPAD/WER DUMP DETECTED",
+                        source=dump["source"],
+                        size=dump["size"],
+                    )
+                seen_dump_keys.update(key for key, _ in new_dumps)
+                dumps_before = dumps_now
+
+            if process_exit:
+                result = "TEST C RESULT: Chrome terminated independently before ATS-TXL cleanup."
+                active["close_reason"] = "unexpected-browser-exit"
+            elif any(
+                active.get(key)
+                for key in (
+                    "page_closed",
+                    "page_crashed",
+                    "context_closed",
+                    "browser_disconnected",
+                )
+            ):
+                result = (
+                    "TEST C RESULT: Playwright observed browser/page/context closure "
+                    "before ATS-TXL cleanup."
+                )
+                active["close_reason"] = "unexpected-browser-exit"
+            elif watch and last_status and last_status.get("alive"):
+                result = (
+                    "TEST C RESULT: Chrome remained alive for "
+                    f"{int(duration_seconds)} seconds after Blob download."
+                )
+                active["close_reason"] = "application-cleanup"
+            else:
+                result = "TEST C RESULT: INCONCLUSIVE; main Chrome PID/exit state could not be verified."
+                active["close_reason"] = "application-cleanup"
+            self._record_test_c_timeline(context, result)
+            self.write_log(result)
+            return result
+        finally:
+            active["test_c_observing"] = False
+            self._close_main_process_watch(watch)
+
     def _begin_export_diagnostic(self, context, page):
+        profile_path = str(self._browser_profile_path or "")
+        browser_processes_before = self._windows_browser_processes(
+            include_command_line=getattr(self, "deep_diagnostic_mode", False)
+        )
+        process_snapshot_for_pid = browser_processes_before
+        if not getattr(self, "deep_diagnostic_mode", False):
+            # Command lines are used only in memory to match the dedicated profile;
+            # never persist this potentially sensitive snapshot in the bundle.
+            process_snapshot_for_pid = self._windows_browser_processes(
+                include_command_line=True
+            )
+        main_browser_process = self._find_main_browser_process(
+            process_snapshot_for_pid, profile_path
+        )
         self._active_export_diagnostic = {
             "id": uuid.uuid4().hex[:10],
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1364,16 +1660,19 @@ class ATSApp(tk.Tk):
             "page_ids": {},
             "network_armed": False,
             "download_event_seen": False,
+            "download_event_monotonic": None,
             "browser_disconnected": False,
             "context_closed": False,
             "page_crashed": False,
+            "test_c_observing": False,
+            "test_c_result": "",
+            "close_reason": "",
             "trace_started": False,
-            "browser_processes_before": self._windows_browser_processes(
-                include_command_line=getattr(self, "deep_diagnostic_mode", False)
-            ),
+            "browser_processes_before": browser_processes_before,
+            "main_browser_process": main_browser_process,
             "windows_extended_before": self._windows_extended_diagnostics(),
             "browser_launches": list(self._browser_launches),
-            "profile_path": str(self._browser_profile_path or ""),
+            "profile_path": profile_path,
             "native_log_path": str(self._browser_native_log_path or ""),
             "chromium_sandbox": (
                 self.chromium_sandbox_enabled.get()
@@ -1388,7 +1687,9 @@ class ATSApp(tk.Tk):
             context.tracing.start(screenshots=True, snapshots=True, sources=True)
             self._active_export_diagnostic["trace_started"] = True
         except Exception as exc:
-            self._record_diagnostic_event(context, "trace-start-failed", message=exc)
+            self._record_diagnostic_event(
+                context, "trace-start-failed", error_type=type(exc).__name__
+            )
 
     @staticmethod
     def _windows_crash_events():
@@ -1707,6 +2008,9 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "screenshot_error": screenshot_error,
             "windows_dump_count": len(dump_paths),
             "windows_dumps": dump_paths,
+            "test_c_result": active.get("test_c_result", ""),
+            "main_browser_process": active.get("main_browser_process"),
+            "close_reason": active.get("close_reason", ""),
             "deep_diagnostic_mode": getattr(self, "deep_diagnostic_mode", False),
             "chromium_sandbox_enabled": active.get("chromium_sandbox"),
             "crashpad_file_count": len(crashpad_index),
@@ -2546,7 +2850,11 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
         # Let the export action reveal its actual network shape. If no request
         # can be safely classified, do not abort a guessed endpoint.
         identify_deadline = time.monotonic() + 10
-        while time.monotonic() < identify_deadline and not state["export_aborted"]:
+        while (
+            time.monotonic() < identify_deadline
+            and not state["export_aborted"]
+            and not active.get("download_event_seen")
+        ):
             if page.is_closed() or active.get("page_crashed") or active.get("context_closed") or active.get("browser_disconnected"):
                 break
             pump_events()
@@ -2565,6 +2873,13 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 result = "TEST A PASS: Export request aborted before Chrome Download Manager. Chrome remained alive for 10 seconds."
         else:
             result = "TEST A INCONCLUSIVE: Could not safely identify the final export request."
+
+        if active.get("download_event_seen"):
+            try:
+                context.unroute("**/*", intercept_test_request)
+            except Exception:
+                pass
+            result = self._observe_test_c(page, context, active, duration_seconds=30)
 
         try:
             context.unroute("**/*", intercept_test_request)
@@ -2587,6 +2902,34 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 note="Browser crashed before Playwright download event.",
                 decision="observed",
             )
+
+        if not active.get("close_reason"):
+            targets_closed = (
+                page.is_closed()
+                or active.get("page_crashed")
+                or active.get("context_closed")
+                or active.get("browser_disconnected")
+            )
+            active["close_reason"] = (
+                "unexpected-browser-exit" if targets_closed else "application-cleanup"
+            )
+        active["test_c_result"] = result if result.startswith("TEST C RESULT:") else ""
+        self.write_log("DIAGNOSTIC CLEANUP STARTED")
+        self._record_test_c_timeline(context, "DIAGNOSTIC CLEANUP STARTED")
+        self.write_log("ATS-TXL is now intentionally closing the browser.")
+        self._record_test_c_timeline(
+            context,
+            "ATS-TXL is now intentionally closing the browser.",
+            close_reason=active["close_reason"],
+        )
+        try:
+            context.close()
+        except Exception as exc:
+            self._record_test_c_timeline(
+                context, "DIAGNOSTIC CLEANUP ERROR", error_type=type(exc).__name__
+            )
+        self.write_log("DIAGNOSTIC CLEANUP FINISHED")
+        self._record_test_c_timeline(context, "DIAGNOSTIC CLEANUP FINISHED")
         active["network_armed"] = False
         self._finish_export_diagnostic(context, page, RuntimeError(result))
         raise DiagnosticTestCompleted(result)
