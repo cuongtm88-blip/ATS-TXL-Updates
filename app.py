@@ -16,6 +16,7 @@ import time
 import uuid
 import shutil
 import zipfile
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -105,6 +106,10 @@ class OneBSSSessionExpiredError(RuntimeError):
 
 class OneBSSSearchTimeoutError(RuntimeError):
     """OneBSS did not finish a search; never export a partial result."""
+
+
+class DiagnosticTestCompleted(RuntimeError):
+    """A deliberate end of the isolated export-network diagnostic test."""
 
 
 def _load_settings():
@@ -1053,8 +1058,10 @@ class ATSApp(tk.Tk):
         active = self._active_export_diagnostic
         if not active or active.get("context") is not context:
             return
-        def redact(value):
+        def redact(value, key=""):
             value = str(value)
+            if key.lower().endswith("url") or key.lower() == "url":
+                return self._safe_diagnostic_url(value)
             return re.sub(
                 r"(?i)(authorization\s*:\s*bearer\s+)([A-Za-z0-9._~-]+)",
                 r"\1[REDACTED]",
@@ -1064,8 +1071,37 @@ class ATSApp(tk.Tk):
             {
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "event": event_name,
-                **{key: redact(value) for key, value in details.items()},
+                **{key: redact(value, key) for key, value in details.items()},
             }
+        )
+
+    @staticmethod
+    def _safe_diagnostic_url(url):
+        """Retain route shape while dropping credentials, query and identifiers."""
+        try:
+            parts = urlsplit(str(url))
+            safe_path = re.sub(
+                r"(?i)([0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{20,}|[a-z0-9_-]{32,}|\d{6,})",
+                "[REDACTED]",
+                parts.path,
+            )
+            return urlunsplit((parts.scheme, parts.hostname or "", safe_path, "[QUERY_REDACTED]" if parts.query else "", ""))[:500]
+        except Exception:
+            return "[URL_REDACTED]"
+
+    @staticmethod
+    def _is_explicit_export_candidate(request):
+        """Flag a high-confidence export candidate when its URL path names an export route."""
+        try:
+            path = urlsplit(request.url).path.lower()
+        except Exception:
+            return False
+        return bool(
+            re.search(
+                r"(?:^|[/_.-])(export(?:excel|xlsx|xls|data|file)?|excel(?:export|download)?|download(?:excel|xlsx|xls|file)?|xlsx|xls|spreadsheet)(?:$|[/_.-])",
+                path,
+            )
+            or re.search(r"\.(?:xlsx?|xlsm|csv)$", path)
         )
 
     def _attach_page_diagnostics(self, context, page):
@@ -1075,9 +1111,7 @@ class ATSApp(tk.Tk):
         self._diagnostic_page_ids.add(page_id)
         page.on(
             "crash",
-            lambda: self._record_diagnostic_event(
-                context, "page-crash", url=self._safe_page_url(page)
-            ),
+            lambda: self._on_diagnostic_page_crashed(context, page),
         )
         page.on(
             "close",
@@ -1103,6 +1137,46 @@ class ATSApp(tk.Tk):
 
         page.on("console", record_console)
 
+        def record_download(download):
+            active = self._active_export_diagnostic
+            if active and active.get("context") is context:
+                active["download_event_seen"] = True
+            self._record_diagnostic_event(
+                context,
+                "DOWNLOAD EVENT DETECTED",
+                suggested_filename=re.sub(
+                    r"(?i)([0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{20,}|[a-z0-9_-]{32,}|\d{6,})",
+                    "[REDACTED]",
+                    Path(download.suggested_filename).name,
+                )[:180],
+                url=self._safe_diagnostic_url(download.url),
+                page_id=self._diagnostic_page_id(context, page),
+            )
+            self._record_network_event(
+                context,
+                event_type="DOWNLOAD EVENT DETECTED",
+                suggested_filename=re.sub(
+                    r"(?i)([0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{20,}|[a-z0-9_-]{32,}|\d{6,})",
+                    "[REDACTED]",
+                    Path(download.suggested_filename).name,
+                )[:180],
+                url=self._safe_diagnostic_url(download.url),
+                page_id=self._diagnostic_page_id(context, page),
+                decision="observed",
+            )
+
+        page.on("download", record_download)
+
+    def _diagnostic_page_id(self, context, page):
+        active = self._active_export_diagnostic
+        if not active or active.get("context") is not context:
+            return ""
+        ids = active.setdefault("page_ids", {})
+        key = id(page)
+        if key not in ids:
+            ids[key] = f"page-{len(ids) + 1}"
+        return ids[key]
+
     def _attach_context_diagnostics(self, context, page):
         """Subscribe once to browser events needed to identify an Export failure."""
         context_id = id(context)
@@ -1110,12 +1184,32 @@ class ATSApp(tk.Tk):
             self._diagnostic_context_ids.add(context_id)
             context.on(
                 "close",
-                lambda: self._record_diagnostic_event(context, "context-close"),
+                lambda: self._on_diagnostic_context_closed(context),
             )
             context.on(
                 "page",
-                lambda new_page: self._attach_page_diagnostics(context, new_page),
+                lambda new_page: self._on_diagnostic_new_page(context, new_page),
             )
+            context.on(
+                "request",
+                lambda request: self._record_network_request(context, request),
+            )
+            context.on(
+                "response",
+                lambda response: self._record_network_response(context, response),
+            )
+            try:
+                context.on(
+                    "serviceworker",
+                    lambda worker: self._record_network_event(
+                        context,
+                        event_type="service-worker-detected",
+                        url=self._safe_diagnostic_url(worker.url),
+                        decision="observed",
+                    ),
+                )
+            except Exception:
+                pass
             context.on(
                 "requestfailed",
                 lambda request: self._record_diagnostic_event(
@@ -1136,13 +1230,126 @@ class ATSApp(tk.Tk):
                 if browser:
                     browser.on(
                         "disconnected",
-                        lambda: self._record_diagnostic_event(
-                            context, "browser-disconnected"
-                        ),
+                        lambda: self._on_diagnostic_browser_disconnected(context),
                     )
             except Exception:
                 pass
         self._attach_page_diagnostics(context, page)
+
+    def _on_diagnostic_new_page(self, context, page):
+        page_id = self._diagnostic_page_id(context, page)
+        self._record_network_event(
+            context, event_type="NEW PAGE DETECTED", page_id=page_id,
+            url=self._safe_diagnostic_url(self._safe_page_url(page)),
+            decision="observed",
+        )
+        self._attach_page_diagnostics(context, page)
+
+    def _on_diagnostic_browser_disconnected(self, context):
+        active = self._active_export_diagnostic
+        if active and active.get("context") is context:
+            active["browser_disconnected"] = True
+            if not active.get("download_event_seen"):
+                self._record_network_event(
+                    context,
+                    event_type="browser-crash-before-download-event",
+                    note="Browser crashed before Playwright download event.",
+                    decision="observed",
+                )
+        self._record_diagnostic_event(context, "browser-disconnected")
+
+    def _on_diagnostic_page_crashed(self, context, page):
+        active = self._active_export_diagnostic
+        if active and active.get("context") is context:
+            active["page_crashed"] = True
+            if not active.get("download_event_seen"):
+                self._record_network_event(
+                    context,
+                    event_type="browser-crash-before-download-event",
+                    note="Browser crashed before Playwright download event.",
+                    page_id=self._diagnostic_page_id(context, page),
+                    decision="observed",
+                )
+        self._record_diagnostic_event(context, "page-crash", url=self._safe_page_url(page))
+
+    def _on_diagnostic_context_closed(self, context):
+        active = self._active_export_diagnostic
+        if active and active.get("context") is context:
+            active["context_closed"] = True
+            if not active.get("download_event_seen"):
+                self._record_network_event(
+                    context,
+                    event_type="browser-crash-before-download-event",
+                    note="Browser crashed before Playwright download event.",
+                    decision="observed",
+                )
+        self._record_diagnostic_event(context, "context-close")
+
+    def _record_network_event(self, context, **event):
+        active = self._active_export_diagnostic
+        if not active or active.get("context") is not context or not active.get("network_armed"):
+            return
+        event.setdefault("timestamp", time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        active.setdefault("network_events", []).append(event)
+
+    def _record_network_request(self, context, request):
+        active = self._active_export_diagnostic
+        if not active or active.get("context") is not context or not active.get("network_armed"):
+            return
+        service_worker_request = False
+        try:
+            service_worker_request = request.service_worker is not None
+        except Exception:
+            pass
+        page = None
+        try:
+            frame = request.frame
+            page = frame.page if frame else None
+        except Exception:
+            page = None
+        resource_type = getattr(request, "resource_type", "")
+        if resource_type not in ("document", "fetch", "xhr", "other"):
+            return
+        self._record_network_event(
+            context,
+            event_type=("service-worker-request" if service_worker_request else "request-observed"),
+            method=getattr(request, "method", ""),
+            resource_type=resource_type,
+            url=self._safe_diagnostic_url(getattr(request, "url", "")),
+            page_id=self._diagnostic_page_id(context, page) if page else "unknown",
+            navigation=bool(getattr(request, "is_navigation_request", lambda: False)()),
+            service_worker_controlled=service_worker_request,
+            decision="observed",
+        )
+
+    def _record_network_response(self, context, response):
+        active = self._active_export_diagnostic
+        if not active or active.get("context") is not context or not active.get("network_armed"):
+            return
+        request = response.request
+        service_worker_request = False
+        try:
+            service_worker_request = request.service_worker is not None
+        except Exception:
+            pass
+        try:
+            from_service_worker = bool(response.from_service_worker)
+        except Exception:
+            from_service_worker = False
+        resource_type = getattr(request, "resource_type", "")
+        if resource_type not in ("document", "fetch", "xhr", "other"):
+            return
+        self._record_network_event(
+            context,
+            event_type=("service-worker-response" if from_service_worker else "response-observed"),
+            method=getattr(request, "method", ""),
+            resource_type=resource_type,
+            url=self._safe_diagnostic_url(response.url),
+            status=response.status,
+            service_worker_controlled=service_worker_request,
+            from_service_worker=from_service_worker,
+            decision="observed",
+        )
 
     def _begin_export_diagnostic(self, context, page):
         self._active_export_diagnostic = {
@@ -1151,8 +1358,15 @@ class ATSApp(tk.Tk):
             "started_epoch": time.time(),
             "context": context,
             "backend": self.browser_backend,
-            "page_url": self._safe_page_url(page),
+            "page_url": self._safe_diagnostic_url(self._safe_page_url(page)),
             "events": [],
+            "network_events": [],
+            "page_ids": {},
+            "network_armed": False,
+            "download_event_seen": False,
+            "browser_disconnected": False,
+            "context_closed": False,
+            "page_crashed": False,
             "trace_started": False,
             "browser_processes_before": self._windows_browser_processes(
                 include_command_line=getattr(self, "deep_diagnostic_mode", False)
@@ -1486,7 +1700,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "browser_backend": active["backend"],
             "export_started_at": active["started_at"],
             "page_url_before_export": active["page_url"],
-            "page_url_after_error": self._safe_page_url(page),
+            "page_url_after_error": self._safe_diagnostic_url(self._safe_page_url(page)),
             "trace_path": str(trace_path) if trace_path.exists() else "",
             "trace_error": trace_error,
             "screenshot_path": str(screenshot_path) if screenshot_path.exists() else "",
@@ -1503,6 +1717,9 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
         (folder / "browser-events.json").write_text(
             json.dumps(active["events"], ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        with (folder / "export-network-events.jsonl").open("w", encoding="utf-8") as stream:
+            for event in active.get("network_events", []):
+                stream.write(json.dumps(event, ensure_ascii=False) + "\n")
         (folder / "windows-events.json").write_text(
             self._windows_crash_events(), encoding="utf-8"
         )
@@ -1636,6 +1853,8 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
         except Exception as exc:
             if self.stop_requested:
                 self.write_log("Đã dừng quy trình theo yêu cầu.")
+            elif isinstance(exc, DiagnosticTestCompleted):
+                self.write_log(str(exc))
             else:
                 self.write_log(f"LỖI: {exc}")
                 error_text = str(exc)
@@ -2143,6 +2362,8 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             self.write_log("Bấm Tìm kiếm và chờ tải hết phiếu...")
             page.get_by_text("Tìm kiếm", exact=True).click(timeout=15000)
             self._wait_for_search_complete(page)
+            if getattr(self, "deep_diagnostic_mode", False):
+                self._run_export_test_a(page, context)
             self.write_log("Bấm Xuất Excel...")
             page.evaluate("""() => {
                 window.__atsTxlExportCapture = {armed: true, blobUrl: null};
@@ -2242,6 +2463,133 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
         except Exception as exc:
             self._finish_export_diagnostic(context, page, exc)
             raise
+
+    def _run_export_test_a(self, page, context):
+        """Observe a browser-context export request and block only a clearly named export route."""
+        active = self._active_export_diagnostic
+        state = {"export_aborted": False, "route_error": None}
+
+        def intercept_test_request(route):
+            request = route.request
+            explicit_export_candidate = self._is_explicit_export_candidate(request)
+            resource_type = getattr(request, "resource_type", "")
+            request_method = getattr(request, "method", "")
+            safe_url = self._safe_diagnostic_url(getattr(request, "url", ""))
+            page_id = "unknown"
+            try:
+                request_page = request.frame.page
+                page_id = self._diagnostic_page_id(context, request_page)
+            except Exception:
+                pass
+            if explicit_export_candidate:
+                export_event = {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "event_type": "HIGH-CONFIDENCE EXPORT CANDIDATE",
+                    "method": request_method,
+                    "resource_type": resource_type,
+                    "url": safe_url,
+                    "page_id": page_id,
+                    "navigation": bool(request.is_navigation_request()),
+                    "decision": "abort-attempted",
+                }
+                active.setdefault("network_events", []).append(export_event)
+                self._record_network_event(
+                    context, event_type="export-interception-attempted",
+                    method=request_method, resource_type=resource_type,
+                    url=safe_url, page_id=page_id,
+                    navigation=bool(request.is_navigation_request()),
+                    decision="abort-attempted",
+                )
+                try:
+                    route.abort(error_code="blockedbyclient")
+                    state["export_aborted"] = True
+                    export_event["decision"] = "aborted"
+                except Exception as exc:
+                    state["route_error"] = type(exc).__name__
+                    export_event["decision"] = "abort-failed"
+                return
+
+            if resource_type in ("document", "fetch", "xhr", "other"):
+                self._record_network_event(
+                    context,
+                event_type="request-candidate",
+                    method=request_method,
+                    resource_type=resource_type,
+                    url=safe_url,
+                    page_id=page_id,
+                    navigation=bool(request.is_navigation_request()),
+                    decision="candidate",
+                )
+            try:
+                route.continue_()
+            except Exception as exc:
+                state["route_error"] = type(exc).__name__
+
+        active["network_armed"] = True
+        context.route("**/*", intercept_test_request)
+        self.write_log("Bấm Xuất Excel... (Test A: theo dõi route ở cấp BrowserContext)")
+
+        def pump_events():
+            try:
+                page.wait_for_timeout(100)
+            except Exception:
+                # A crashed renderer/browser is itself evidence; the registered
+                # page/context listeners have already recorded its event.
+                pass
+
+        click_error = None
+        try:
+            page.get_by_text("Xuất Excel", exact=True).click(timeout=15000)
+        except Exception as exc:
+            click_error = exc
+
+        # Let the export action reveal its actual network shape. If no request
+        # can be safely classified, do not abort a guessed endpoint.
+        identify_deadline = time.monotonic() + 10
+        while time.monotonic() < identify_deadline and not state["export_aborted"]:
+            if page.is_closed() or active.get("page_crashed") or active.get("context_closed") or active.get("browser_disconnected"):
+                break
+            pump_events()
+
+        if state["export_aborted"]:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if page.is_closed() or active.get("page_crashed") or active.get("context_closed") or active.get("browser_disconnected"):
+                    break
+                pump_events()
+            if page.is_closed() or active.get("page_crashed") or active.get("context_closed") or active.get("browser_disconnected"):
+                result = "TEST A FAIL: Chrome crashed despite export request interception."
+            elif active.get("download_event_seen"):
+                result = "TEST A INCONCLUSIVE: Could not safely identify the final export request."
+            else:
+                result = "TEST A PASS: Export request aborted before Chrome Download Manager. Chrome remained alive for 10 seconds."
+        else:
+            result = "TEST A INCONCLUSIVE: Could not safely identify the final export request."
+
+        try:
+            context.unroute("**/*", intercept_test_request)
+        except Exception:
+            pass
+        if state["route_error"]:
+            self._record_network_event(
+                context, event_type="route-handler-error", decision="candidate"
+            )
+        if click_error:
+            self._record_network_event(
+                context, event_type="export-click-error", decision="candidate"
+            )
+        if not active.get("download_event_seen") and (
+            page.is_closed() or active.get("page_crashed") or active.get("context_closed") or active.get("browser_disconnected")
+        ):
+            self._record_network_event(
+                context,
+                event_type="browser-crash-before-download-event",
+                note="Browser crashed before Playwright download event.",
+                decision="observed",
+            )
+        active["network_armed"] = False
+        self._finish_export_diagnostic(context, page, RuntimeError(result))
+        raise DiagnosticTestCompleted(result)
 
     @staticmethod
     def _is_xlsx_payload(body):

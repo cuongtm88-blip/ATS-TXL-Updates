@@ -15,6 +15,20 @@ import updater
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_diagnostic_url_redacts_queries_and_identifiers(self):
+        url = "https://onebss.vnpt.vn/api/exportExcel/12345678?access_token=secret"
+        safe = app.ATSApp._safe_diagnostic_url(url)
+        self.assertNotIn("secret", safe)
+        self.assertNotIn("12345678", safe)
+        self.assertIn("[QUERY_REDACTED]", safe)
+        self.assertIn("exportExcel", safe)
+
+    def test_test_a_only_flags_explicit_export_candidates(self):
+        export = SimpleNamespace(url="https://onebss.vnpt.vn/api/exportExcel")
+        ambiguous = SimpleNamespace(url="https://onebss.vnpt.vn/api/queryRecords")
+        self.assertTrue(app.ATSApp._is_explicit_export_candidate(export))
+        self.assertFalse(app.ATSApp._is_explicit_export_candidate(ambiguous))
+
     def test_xlsx_response_is_recognized_by_ooxml_structure(self):
         stream = io.BytesIO()
         with zipfile.ZipFile(stream, "w") as workbook:
@@ -365,6 +379,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_diagnostic_upload_never_includes_native_chromium_log(self):
         self.assertNotIn("chromium-native.log", diagnostics_upload.DEFAULT_FILES)
+        self.assertIn("export-network-events.jsonl", diagnostics_upload.DEFAULT_FILES)
 
     def test_token_expiry_warning_is_sent_once_per_token(self):
         expiry = time.time() + 10 * 60

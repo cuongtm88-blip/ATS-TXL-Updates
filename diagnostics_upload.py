@@ -21,6 +21,7 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 DEFAULT_FILES = (
     "summary.json",
     "browser-events.json",
+    "export-network-events.jsonl",
     "windows-events.json",
     "windows-extended-diagnostics.json",
     "browser-processes.json",
