@@ -1,8 +1,10 @@
 """ATS TXL - automated OneBSS export and Telegram reporting."""
 from __future__ import annotations
 
-import json
+import base64
 import html
+import io
+import json
 import os
 import platform
 import re
@@ -13,6 +15,7 @@ import threading
 import time
 import uuid
 import shutil
+import zipfile
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -88,6 +91,7 @@ LEGACY_BROWSER_CHOICES = {
     "Google Chrome cài sẵn": "Google Chrome (mặc định)",
 }
 ONEBSS_EXPIRY_WARNING_SECONDS = 15 * 60
+MAX_EXCEL_CAPTURE_BYTES = 100 * 1024 * 1024
 
 
 def _normalise_browser_choice(value, default):
@@ -2076,22 +2080,168 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
         self._ensure_onebss_session_active(page)
         self._last_diagnostic_path = None
         self._begin_export_diagnostic(context, page)
+        target = DOWNLOADS / ("Bao_hong_ton_" + time.strftime("%Y%m%d%H%M%S") + ".xlsx")
+        capture = {"path": None, "error": None, "source": None}
+
+        def intercept_export_request(route):
+            """Fetch export-triggered responses outside Chrome's download manager."""
+            try:
+                response = route.fetch(timeout=120000)
+                headers = {key.lower(): value for key, value in response.headers.items()}
+                content_type = headers.get("content-type", "").lower()
+                disposition = headers.get("content-disposition", "").lower()
+                request_type = route.request.resource_type
+                candidate = (
+                    "attachment" in disposition
+                    or "spreadsheet" in content_type
+                    or "excel" in content_type
+                    or "application/zip" in content_type
+                    or (
+                        request_type in ("xhr", "fetch", "document", "other")
+                        and "application/octet-stream" in content_type
+                    )
+                )
+                if not candidate:
+                    route.fulfill(response=response)
+                    return
+                try:
+                    response_size = int(headers.get("content-length", "0"))
+                except ValueError:
+                    response_size = 0
+                if response_size > MAX_EXCEL_CAPTURE_BYTES:
+                    capture["error"] = "response-too-large"
+                    route.abort(error_code="blockedbyclient")
+                    return
+                body = response.body()
+                if self._is_xlsx_payload(body):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(body)
+                    capture.update(path=target, source="api-response")
+                    route.abort(error_code="blockedbyclient")
+                    return
+                if (
+                    "attachment" in disposition
+                    or "spreadsheet" in content_type
+                    or "excel" in content_type
+                    or "application/zip" in content_type
+                    or "application/octet-stream" in content_type
+                ):
+                    capture["error"] = "unsupported-attachment"
+                    route.abort(error_code="blockedbyclient")
+                    return
+                route.fulfill(response=response)
+            except Exception as exc:
+                # Do not retry a request after route.fetch(): it may already
+                # have reached OneBSS. Abort rather than risk duplicate work.
+                capture["error"] = type(exc).__name__
+                try:
+                    route.abort(error_code="failed")
+                except Exception:
+                    pass
+
         try:
             self.write_log("Bấm Tìm kiếm và chờ tải hết phiếu...")
             page.get_by_text("Tìm kiếm", exact=True).click(timeout=15000)
             self._wait_for_search_complete(page)
             self.write_log("Bấm Xuất Excel...")
-            with page.expect_download(timeout=120000) as download_info:
+            page.evaluate("""() => {
+                window.__atsTxlExportCapture = {armed: true, blobUrl: null};
+                if (!window.__atsTxlExportCaptureListener) {
+                    document.addEventListener('click', event => {
+                        if (!window.__atsTxlExportCapture?.armed) return;
+                        const anchor = event.target instanceof Element
+                            ? event.target.closest('a[href^="blob:"]') : null;
+                        if (!anchor) return;
+                        event.preventDefault();
+                        window.__atsTxlExportCapture.blobUrl = anchor.href;
+                        window.__atsTxlExportCapture.filename = anchor.download || '';
+                    }, true);
+                    window.__atsTxlExportCaptureListener = true;
+                }
+            }""")
+            page.route("**/*", intercept_export_request)
+            click_error = None
+            try:
                 page.get_by_text("Xuất Excel", exact=True).click(timeout=15000)
-            download = download_info.value
-            target = DOWNLOADS / ("Bao_hong_ton_" + time.strftime("%Y%m%d%H%M%S") + ".xlsx")
-            download.save_as(str(target))
+            except Exception as exc:
+                # The intercepted file response is intentionally aborted. Some
+                # OneBSS export buttons surface that as a failed navigation.
+                click_error = exc
+            finally:
+                try:
+                    page.unroute("**/*", intercept_export_request)
+                except Exception:
+                    pass
+
+            if capture["path"] is None and not page.is_closed():
+                try:
+                    page.wait_for_function(
+                        "() => Boolean(window.__atsTxlExportCapture?.blobUrl)",
+                        timeout=10000,
+                    )
+                    blob_result = page.evaluate("""async () => {
+                        const capture = window.__atsTxlExportCapture;
+                        const blob = await fetch(capture.blobUrl).then(response => response.blob());
+                        const bytes = new Uint8Array(await blob.arrayBuffer());
+                        if (bytes.length > 100 * 1024 * 1024) {
+                            throw new Error('export-file-too-large');
+                        }
+                        let binary = '';
+                        const chunkSize = 0x8000;
+                        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+                            binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+                        }
+                        URL.revokeObjectURL(capture.blobUrl);
+                        capture.armed = false;
+                        return {base64: btoa(binary), size: bytes.length};
+                    }""")
+                    blob_bytes = base64.b64decode(blob_result["base64"], validate=True)
+                    if len(blob_bytes) > MAX_EXCEL_CAPTURE_BYTES:
+                        raise RuntimeError("Tệp Excel vượt quá giới hạn an toàn 100 MiB.")
+                    if not self._is_xlsx_payload(blob_bytes):
+                        raise RuntimeError("OneBSS tạo Blob nhưng nội dung không phải tệp XLSX hợp lệ.")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(blob_bytes)
+                    capture.update(path=target, source="page-blob")
+                except Exception as exc:
+                    if capture["error"]:
+                        raise RuntimeError(
+                            "Không lấy được response Excel trực tiếp từ OneBSS; "
+                            "chi tiết kỹ thuật đã ghi trong gói chẩn đoán."
+                        ) from exc
+                    if click_error is not None:
+                        raise click_error
+                    raise RuntimeError(
+                        "OneBSS không trả response XLSX hoặc Blob Excel; "
+                        "ATS TXL không khởi chạy tải xuống qua Chrome."
+                    ) from exc
+            elif capture["path"] is None:
+                raise RuntimeError(
+                    "Chrome đã đóng trước khi nhận được response Excel từ OneBSS."
+                ) from click_error
+
+            if capture["source"] == "api-response":
+                self.write_log("Đã nhận và lưu response XLSX trực tiếp; không chuyển file qua Chrome Download Manager.")
+            else:
+                self.write_log("Đã lấy Excel từ Blob OneBSS và lưu trực tiếp; không chuyển file qua Chrome Download Manager.")
             self._finish_export_diagnostic(context, page)
             self.write_log(f"Đã lưu Excel: {target}")
             return target
         except Exception as exc:
             self._finish_export_diagnostic(context, page, exc)
             raise
+
+    @staticmethod
+    def _is_xlsx_payload(body):
+        """Recognize an OOXML workbook without logging or persisting response metadata."""
+        if not body or not body.startswith(b"PK"):
+            return False
+        try:
+            with zipfile.ZipFile(io.BytesIO(body)) as workbook:
+                names = set(workbook.namelist())
+            return "[Content_Types].xml" in names and "xl/workbook.xml" in names
+        except (OSError, zipfile.BadZipFile):
+            return False
 
     @staticmethod
     def _is_excel_download_timeout(exc):

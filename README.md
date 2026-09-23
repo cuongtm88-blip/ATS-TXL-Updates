@@ -89,6 +89,22 @@ Bản đã cài trên Windows tự kiểm tra cập nhật sau khi mở và ki�
 Người dùng cũng có thể bấm `Kiểm tra cập nhật` trên giao diện. Khi có phiên bản
 mới, ứng dụng tải bộ cài, kiểm tra SHA-256, rồi mở bộ cài để cập nhật đè an toàn.
 
+### Bản test 1.1.16-diagnostic: xuất Excel không qua Chrome Download Manager
+
+Bản test này chỉ dùng trên máy kiểm thử. Khi bấm Xuất Excel, ATS TXL định
+tuyến request phát sinh trong thao tác đó qua Playwright, dùng phiên hiện tại
+của OneBSS để lấy response XLSX và lưu trực tiếp. Nếu OneBSS tạo file bằng
+`blob:` ở trang, ứng dụng chặn thao tác tải Blob và lưu dữ liệu Blob trực tiếp.
+Trong cả hai nhánh, ứng dụng không dùng `expect_download()`/`save_as()` và không
+chuyển file qua Chrome Download Manager. Nếu không nhận diện được file XLSX,
+ứng dụng dừng thay vì quay về cách tải file cũ.
+
+Sau khi cài bản test, đăng nhập OneBSS như thường lệ, chọn bộ lọc và chạy một
+chu kỳ. Ghi lại dòng nhật ký xác nhận `response XLSX trực tiếp` hay `Blob
+OneBSS`, việc xử lý Excel có hoàn tất không, và có còn crash không. Không bật
+hoặc gửi trace chẩn đoán nếu chưa chấp nhận khả năng trace chứa dữ liệu trang
+OneBSS; cookie, token và body request không được ghi vào log xuất Excel.
+
 Token Telegram, Chat ID, chu kỳ lặp và danh sách người nhận cảnh báo được lưu
 trong thư mục dữ liệu riêng của người dùng, không nằm trong thư mục cài đặt. Vì
 vậy việc cập nhật không làm mất cấu hình. GitHub token chẩn đoán được lưu trong

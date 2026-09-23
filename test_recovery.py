@@ -1,8 +1,10 @@
 """Regression tests for Windows browser recovery and OneBSS auth detection."""
 
+import io
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,6 +15,20 @@ import updater
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_xlsx_response_is_recognized_by_ooxml_structure(self):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as workbook:
+            workbook.writestr("[Content_Types].xml", "<Types/>")
+            workbook.writestr("xl/workbook.xml", "<workbook/>")
+        self.assertTrue(app.ATSApp._is_xlsx_payload(stream.getvalue()))
+
+    def test_arbitrary_zip_is_not_mistaken_for_xlsx(self):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr("readme.txt", "not a workbook")
+        self.assertFalse(app.ATSApp._is_xlsx_payload(stream.getvalue()))
+        self.assertFalse(app.ATSApp._is_xlsx_payload(b"not an xlsx"))
+
     def test_expired_jwt_is_detected_even_on_inventory_page(self):
         page = Mock()
         page.is_closed.return_value = False

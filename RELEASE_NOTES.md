@@ -1,4 +1,21 @@
-## Bản test chẩn đoán 1.1.15-diagnostic
+## Bản test xuất Excel không qua Chrome Download Manager 1.1.16-diagnostic
+
+- Bản thử nghiệm chỉ dành cho Windows test; không phải bản chính thức và
+  không tự cập nhật các bản vận hành.
+- Khi bấm Xuất Excel, Playwright tạm định tuyến request phát sinh từ thao tác
+  này và gửi request qua `route.fetch()` với session hiện tại. Nếu response là
+  workbook XLSX hợp lệ, ứng dụng lưu body trực tiếp và chặn response trước khi
+  Chrome xử lý lượt tải xuống.
+- Nếu OneBSS dựng XLSX thành Blob trong trang, ứng dụng chặn click tải Blob và
+  lưu bytes của Blob trực tiếp, không qua Chrome Download Manager.
+- Không ghi cookie, token, header xác thực hay body request vào log. Nếu không
+  nhận diện được XLSX response/Blob thì dừng với lỗi; không quay lại cách tải
+  file qua Chrome.
+- Mục tiêu test là xác nhận có thể hoàn tất xuất/xử lý Excel mà không kích hoạt
+  đường tải xuống Chrome đã xuất hiện trong hai crash dump. Kết quả thành công
+  chưa tự nó chứng minh nguyên nhân gốc sâu hơn của lỗi Chrome.
+
+## Bản test chẩn đoán sâu 1.1.15-diagnostic
 
 - Tiếp nối chế độ dừng tại lỗi đầu tiên, không tự phục hồi và không tự cập nhật;
   giữ lựa chọn Google Chrome, Microsoft Edge hoặc Chromium tích hợp để kiểm tra
