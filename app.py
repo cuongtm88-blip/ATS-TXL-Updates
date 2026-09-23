@@ -2146,6 +2146,18 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             self.write_log("Bấm Xuất Excel...")
             page.evaluate("""() => {
                 window.__atsTxlExportCapture = {armed: true, blobUrl: null};
+                if (!window.__atsTxlOriginalAnchorClick) {
+                    window.__atsTxlOriginalAnchorClick = HTMLAnchorElement.prototype.click;
+                    HTMLAnchorElement.prototype.click = function(...args) {
+                        const capture = window.__atsTxlExportCapture;
+                        if (capture?.armed && this.href.startsWith('blob:')) {
+                            capture.blobUrl = this.href;
+                            capture.filename = this.download || '';
+                            return;
+                        }
+                        return window.__atsTxlOriginalAnchorClick.apply(this, args);
+                    };
+                }
                 if (!window.__atsTxlExportCaptureListener) {
                     document.addEventListener('click', event => {
                         if (!window.__atsTxlExportCapture?.armed) return;
