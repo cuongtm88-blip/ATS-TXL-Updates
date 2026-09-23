@@ -229,6 +229,9 @@ class ATSApp(tk.Tk):
         self.browser_choice = tk.StringVar(
             value=_normalise_browser_choice(saved_browser, default_browser)
         )
+        self.chromium_sandbox_enabled = tk.BooleanVar(
+            value=bool(saved.get("diagnostic_chromium_sandbox", False))
+        )
         self._onebss_token_expires_at = None
         self._onebss_expiry_warning_for = None
         self._onebss_expired_alert_for = None
@@ -345,10 +348,23 @@ class ATSApp(tk.Tk):
             text="Kèm Playwright trace (có thể chứa token và dữ liệu OneBSS)",
             variable=self.github_include_trace,
         ).grid(row=2, column=1, columnspan=2, sticky="w", padx=12, pady=(0, 4))
+        if self.deep_diagnostic_mode:
+            ttk.Checkbutton(
+                diagnostics_box,
+                text="Thử bật Chromium sandbox (A/B; mặc định tắt)",
+                variable=self.chromium_sandbox_enabled,
+            ).grid(row=3, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
         ttk.Label(
             diagnostics_box,
             text="Token chỉ lưu trong Windows Credential Manager/Keychain; không ghi vào settings.json hay GitHub public.",
-        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
+        ).grid(
+            row=4 if self.deep_diagnostic_mode else 3,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            padx=12,
+            pady=(0, 8),
+        )
         diagnostics_box.columnconfigure(2, weight=1)
 
         actions = ttk.Frame(self)
@@ -763,6 +779,10 @@ class ATSApp(tk.Tk):
             "github_include_trace": bool(self.github_include_trace.get()),
             "diagnostics_machine_id": self.diagnostics_machine_id,
         })
+        if getattr(self, "deep_diagnostic_mode", False):
+            settings["diagnostic_chromium_sandbox"] = bool(
+                self.chromium_sandbox_enabled.get()
+            )
         self._diagnostics_upload_config = (
             {
                 "repository": repository,
@@ -1137,6 +1157,12 @@ class ATSApp(tk.Tk):
             "browser_launches": list(self._browser_launches),
             "profile_path": str(self._browser_profile_path or ""),
             "native_log_path": str(self._browser_native_log_path or ""),
+            "chromium_sandbox": (
+                self.chromium_sandbox_enabled.get()
+                if getattr(self, "deep_diagnostic_mode", False)
+                and getattr(self, "chromium_sandbox_enabled", None) is not None
+                else None
+            ),
             "process_exit_monitor": dict(self._process_exit_monitor_paths),
         }
         self._attach_context_diagnostics(context, page)
@@ -1464,6 +1490,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "windows_dump_count": len(dump_paths),
             "windows_dumps": dump_paths,
             "deep_diagnostic_mode": getattr(self, "deep_diagnostic_mode", False),
+            "chromium_sandbox_enabled": active.get("chromium_sandbox"),
             "crashpad_file_count": len(crashpad_index),
         }
         (folder / "summary.json").write_text(
@@ -1798,6 +1825,19 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "accept_downloads": True,
             "viewport": {"width": 1440, "height": 900},
         }
+        if getattr(self, "deep_diagnostic_mode", False):
+            sandbox_enabled = bool(
+                getattr(self, "chromium_sandbox_enabled", None)
+                and self.chromium_sandbox_enabled.get()
+            )
+            # Playwright otherwise adds --no-sandbox to Chromium. This
+            # diagnostic-only switch allows a controlled A/B without changing
+            # the production browser launch configuration.
+            options["chromium_sandbox"] = sandbox_enabled
+            self.write_log(
+                "Thử nghiệm sandbox Chromium: "
+                + ("đã bật (A/B)" if sandbox_enabled else "tắt theo mặc định Playwright")
+            )
         if browser_channel is None and use_configured_channel:
             browser_channel = BROWSER_CHOICES.get(self.browser_choice.get(), "chrome")
         if browser_channel:
@@ -1840,6 +1880,14 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 {
                     "time": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "backend": self.browser_backend,
+                    "chromium_sandbox_enabled": options.get("chromium_sandbox"),
+                    "sandbox_experiment": (
+                        "enabled"
+                        if options.get("chromium_sandbox") is True
+                        else "disabled-default-no-sandbox"
+                        if "chromium_sandbox" in options
+                        else "not-applicable"
+                    ),
                     "profile_path": str(selected_profile),
                     "native_log_path": str(self._browser_native_log_path or ""),
                     "processes": self._windows_browser_processes(include_command_line=True),

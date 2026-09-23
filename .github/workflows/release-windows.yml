@@ -68,6 +68,9 @@ jobs:
         run: |
           choco install innosetup --no-progress --yes
           $version = (python -c "from version import APP_VERSION; print(APP_VERSION)").Trim()
+          $isDiagnostic = "${{ inputs.diagnostic }}" -eq "true"
+          if ($isDiagnostic -and !$version.EndsWith("-diagnostic")) { throw "Diagnostic builds must use a -diagnostic version suffix." }
+          if (!$isDiagnostic -and $version.EndsWith("-diagnostic")) { throw "Refusing to publish a diagnostic build to the stable channel." }
           $args = @("/DMyAppVersion=$version")
           if ("${{ inputs.diagnostic }}" -eq "true") { $args += "/DDiagnosticBuild" }
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" @args "installer\ATS-TXL.iss"
@@ -78,6 +81,9 @@ jobs:
         shell: pwsh
         run: |
           $version = (python -c "from version import APP_VERSION; print(APP_VERSION)").Trim()
+          $isDiagnostic = "${{ inputs.diagnostic }}" -eq "true"
+          if ($isDiagnostic -and !$version.EndsWith("-diagnostic")) { throw "Diagnostic builds must use a -diagnostic version suffix." }
+          if (!$isDiagnostic -and $version.EndsWith("-diagnostic")) { throw "Refusing to publish a diagnostic build to the stable channel." }
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist/ATS-TXL-Setup.exe").Hash.ToLower()
           Set-Content -LiteralPath "dist/ATS-TXL-Setup.exe.sha256" -Value "$hash  ATS-TXL-Setup.exe" -Encoding ascii
           "version=$version" >> $env:GITHUB_OUTPUT
@@ -103,6 +109,6 @@ jobs:
             gh release upload $tag "dist/ATS-TXL-Setup.exe#ATS-TXL-Setup.exe" "dist/ATS-TXL-Setup.exe.sha256#ATS-TXL-Setup.exe.sha256" --clobber --repo $env:GITHUB_REPOSITORY
           } else {
             $releaseArgs = @($tag, "dist/ATS-TXL-Setup.exe#ATS-TXL-Setup.exe", "dist/ATS-TXL-Setup.exe.sha256#ATS-TXL-Setup.exe.sha256", "--repo", $env:GITHUB_REPOSITORY, "--title", "ATS TXL v$env:VERSION", "--notes-file", "RELEASE_NOTES.md")
-            if ("${{ inputs.diagnostic }}" -eq "true") { $releaseArgs += "--prerelease" } else { $releaseArgs += "--latest" }
+            if ($isDiagnostic) { $releaseArgs += "--prerelease" } else { $releaseArgs += "--latest" }
             gh release create @releaseArgs
           }

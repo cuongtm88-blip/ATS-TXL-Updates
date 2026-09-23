@@ -1,3 +1,18 @@
+## Bản test chẩn đoán 1.1.15-diagnostic
+
+- Tiếp nối chế độ dừng tại lỗi đầu tiên, không tự phục hồi và không tự cập nhật;
+  giữ lựa chọn Google Chrome, Microsoft Edge hoặc Chromium tích hợp để kiểm tra
+  có đối chứng.
+- Thêm lựa chọn A/B bật Chromium sandbox. Mặc định giữ hành vi Playwright hiện
+  tại (`--no-sandbox`); bật lựa chọn để thử khởi chạy với sandbox. Cấu hình được
+  ghi trong `summary.json` và `browser-launches.json` để đối chiếu.
+- Bổ sung log tiến trình kết thúc, Chromium native log và chỉ mục/sao chép
+  Crashpad vào gói chẩn đoán hiện có. Dump thô và Crashpad vẫn chỉ lưu cục bộ;
+  không tự tải lên GitHub.
+- Gỡ ứng dụng không xóa `C:\ATS-TXL-Dumps`, nhằm giữ lại bằng chứng crash để
+  người kiểm tra thu thập thủ công.
+- Đây là GitHub prerelease dành riêng cho máy test, không phải bản chính thức.
+
 ## Nội dung cập nhật 1.1.14
 
 - Hiển thị thời hạn phiên OneBSS trên một hàng riêng để bộ đếm luôn nằm trong

@@ -54,8 +54,3 @@ Name: "desktopicon"; Description: "Tạo biểu tượng trên màn hình Deskto
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Mở ATS TXL"; Flags: nowait postinstall skipifsilent
-
-#ifdef DiagnosticBuild
-[UninstallDelete]
-Type: filesandordirs; Name: "C:\ATS-TXL-Dumps"
-#endif

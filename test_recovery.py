@@ -402,6 +402,7 @@ class RecoveryTests(unittest.TestCase):
                 browser_backend="",
                 deep_diagnostic_mode=True,
                 browser_choice=SimpleNamespace(get=lambda: "Google Chrome (mặc định)"),
+                write_log=Mock(),
                 _browser_launches=[],
                 _windows_browser_processes=Mock(return_value=[]),
             )
@@ -409,6 +410,33 @@ class RecoveryTests(unittest.TestCase):
                 app.ATSApp._launch_browser_context(state, browser, profile=Path(temporary) / "profile")
             options = browser.chromium.launch_persistent_context.call_args.kwargs
             self.assertEqual(options["channel"], "chrome")
+
+    def test_sandbox_ab_switch_is_limited_to_deep_diagnostic_build(self):
+        for deep_mode, selected, expected in (
+            (True, True, True),
+            (True, False, False),
+            (False, True, None),
+        ):
+            with self.subTest(deep_mode=deep_mode, selected=selected), tempfile.TemporaryDirectory() as temporary:
+                browser = Mock()
+                state = SimpleNamespace(
+                    browser_backend="",
+                    browser_choice=SimpleNamespace(get=lambda: "Google Chrome (mặc định)"),
+                    deep_diagnostic_mode=deep_mode,
+                    chromium_sandbox_enabled=SimpleNamespace(get=lambda: selected),
+                    write_log=Mock(),
+                    _browser_launches=[],
+                    _windows_browser_processes=Mock(return_value=[]),
+                )
+                with patch.object(app.sys, "platform", "win32"):
+                    app.ATSApp._launch_browser_context(
+                        state, browser, profile=Path(temporary) / "profile"
+                    )
+                options = browser.chromium.launch_persistent_context.call_args.kwargs
+                if expected is None:
+                    self.assertNotIn("chromium_sandbox", options)
+                else:
+                    self.assertIs(options["chromium_sandbox"], expected)
 
 
 if __name__ == "__main__":
