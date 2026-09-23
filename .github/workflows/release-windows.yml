@@ -104,8 +104,11 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           $tag = "v$env:VERSION"
+          $isDiagnostic = $env:VERSION.EndsWith("-diagnostic")
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
+            if ($isDiagnostic) { gh release edit $tag --prerelease --repo $env:GITHUB_REPOSITORY }
+            else { gh release edit $tag --latest --repo $env:GITHUB_REPOSITORY }
             gh release upload $tag "dist/ATS-TXL-Setup.exe#ATS-TXL-Setup.exe" "dist/ATS-TXL-Setup.exe.sha256#ATS-TXL-Setup.exe.sha256" --clobber --repo $env:GITHUB_REPOSITORY
           } else {
             $releaseArgs = @($tag, "dist/ATS-TXL-Setup.exe#ATS-TXL-Setup.exe", "dist/ATS-TXL-Setup.exe.sha256#ATS-TXL-Setup.exe.sha256", "--repo", $env:GITHUB_REPOSITORY, "--title", "ATS TXL v$env:VERSION", "--notes-file", "RELEASE_NOTES.md")
