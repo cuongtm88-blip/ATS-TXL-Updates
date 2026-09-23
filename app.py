@@ -376,7 +376,10 @@ class ATSApp(tk.Tk):
             width=27,
         ).pack(side="left")
         self.onebss_token_status = tk.StringVar(value="Phiên OneBSS: chưa kiểm tra")
-        ttk.Label(actions, textvariable=self.onebss_token_status).pack(side="left", padx=(14, 0))
+
+        session_status = ttk.Frame(self)
+        session_status.pack(fill="x", padx=16, pady=(0, 5))
+        ttk.Label(session_status, textvariable=self.onebss_token_status).pack(side="left")
 
         self.progress = ttk.Progressbar(self, mode="indeterminate")
         self.progress.pack(fill="x", padx=12, pady=(0, 8))
@@ -1542,10 +1545,16 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 )
                 self.current_stage = "Chờ người dùng hoàn tất đăng nhập và bấm bước 2"
                 while not self.stop_requested:
-                    self.start_event.wait()
+                    signaled = self.start_event.wait(timeout=5)
                     if self.stop_requested:
                         return
-                    if not self._onebss_session_expired(page):
+                    expires_at = self._onebss_token_expiry(page)
+                    if expires_at:
+                        self._set_onebss_token_status(expires_at)
+                        self._maybe_warn_onebss_session_expiring(expires_at)
+                    if not signaled:
+                        continue
+                    if not self._onebss_session_expired(page, expires_at or None):
                         break
                     self.write_log(
                         "OneBSS chưa đăng nhập xong. Hãy hoàn tất OTP, rồi bấm lại bước 2; "

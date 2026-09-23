@@ -1,3 +1,11 @@
+## Nội dung cập nhật 1.1.14
+
+- Hiển thị thời hạn phiên OneBSS trên một hàng riêng để bộ đếm luôn nằm trong
+  cửa sổ ứng dụng, kể cả khi dùng màn hình hẹp.
+- Trong bước đăng nhập/OTP, kiểm tra token định kỳ và cập nhật bộ đếm cũng như
+  cảnh báo sắp hết phiên mà không điều hướng hoặc làm mới trang. Người dùng vẫn
+  bấm bước 2 sau khi đăng nhập xong.
+
 ## Nội dung cập nhật 1.1.13
 
 - Sửa lỗi cập nhật Windows bị Inno Setup báo không ghi đè được

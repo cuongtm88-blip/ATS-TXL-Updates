@@ -103,7 +103,9 @@ thiếu bản ghi. Từ bản 1.1.12, Windows mặc định dùng Google Chrome 
 chọn Microsoft Edge hoặc Chromium tích hợp. Mỗi browser dùng profile OneBSS
 riêng nên khi đổi browser cần đăng nhập/OTP lại. Giao diện hiển thị thời gian
 còn lại của access token OneBSS; Telegram cảnh báo khi còn tối đa 15 phút và
-khi phiên hết hạn. Bật "Giữ máy thức" không kéo dài phiên đăng nhập OneBSS.
+khi phiên hết hạn. Từ bản 1.1.14, trạng thái phiên nằm trên hàng riêng và được
+cập nhật cả trong lúc người dùng đăng nhập/nhập OTP ở bước 1. Bật "Giữ máy
+thức" không kéo dài phiên đăng nhập OneBSS.
 
 ### Bản test chẩn đoán sâu 1.1.11-diagnostic
 

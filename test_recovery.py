@@ -274,6 +274,9 @@ class RecoveryTests(unittest.TestCase):
             _start_process_exit_monitor=Mock(),
             _stop_process_exit_monitor=Mock(),
             _onebss_session_expired=Mock(return_value=False),
+            _onebss_token_expiry=Mock(return_value=1_800_000_000),
+            _set_onebss_token_status=Mock(),
+            _maybe_warn_onebss_session_expiring=Mock(),
             _ensure_onebss_session_active=Mock(),
             _acquire_keep_awake=Mock(),
             _release_keep_awake=Mock(),
@@ -292,11 +295,16 @@ class RecoveryTests(unittest.TestCase):
         state._wait_for_reauthentication.side_effect = (
             lambda *_: context.close.assert_not_called()
         )
+        state.start_event.wait.side_effect = [False, True]
         with tempfile.TemporaryDirectory() as temporary, patch.object(
             app, "DOWNLOADS", Path(temporary)
         ), patch.object(app, "sync_playwright") as playwright:
             app.ATSApp._session_workflow(state)
         self.assertEqual(state._export_excel_with_recovery.call_count, 2)
+        self.assertEqual(state.start_event.wait.call_count, 2)
+        self.assertEqual(state._onebss_token_expiry.call_count, 2)
+        state._set_onebss_token_status.assert_called_with(1_800_000_000)
+        state._maybe_warn_onebss_session_expiring.assert_called_with(1_800_000_000)
         state._wait_for_reauthentication.assert_called_once()
         state._process_and_send.assert_called_once_with("report.xlsx")
         state._start_process_exit_monitor.assert_called_once()
