@@ -644,12 +644,7 @@ class ATSApp(tk.Tk):
             self._finish_update_download_error(str(exc))
             return
         self.write_log(
-            f"Đã xác minh bộ cài ATS TXL {info.version}; đang mở bộ cài để cập nhật."
-        )
-        messagebox.showinfo(
-            "Cập nhật ATS TXL",
-            f"Đã tải và xác minh phiên bản {info.version}.\n"
-            "Bộ cài sẽ đóng ứng dụng, cập nhật và mở lại phiên bản mới.",
+            f"Đã xác minh bộ cài ATS TXL {info.version}; ứng dụng sẽ thoát trước khi cài đặt."
         )
         self.destroy()
 

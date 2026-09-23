@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import app
 import diagnostics_upload
+import updater
 
 
 class RecoveryTests(unittest.TestCase):
@@ -353,6 +354,38 @@ class RecoveryTests(unittest.TestCase):
         app.ATSApp._maybe_warn_onebss_session_expiring(state, expiry)
         app.ATSApp._maybe_warn_onebss_session_expiring(state, expiry)
         state._send_onebss_session_alert.assert_called_once_with(expiry, expiring=True)
+
+    def test_installer_launcher_waits_for_ats_process_before_starting_setup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            installer = Path(temporary) / "ATS-TXL-Setup.exe"
+            installer.touch()
+            with patch.object(updater, "can_self_update", return_value=True), patch.object(
+                updater.os, "getpid", return_value=24680
+            ), patch.object(updater.subprocess, "Popen") as popen:
+                launcher = updater.launch_windows_installer(installer)
+            script = Path(temporary) / "launch-install-24680.ps1"
+            content = script.read_text(encoding="utf-8-sig")
+            self.assertIn("Wait-Process -Id $targetProcessId", content)
+            self.assertLess(content.index("Wait-Process"), content.index("Start-Process"))
+            self.assertIn("24680", content)
+            self.assertEqual(launcher, popen.return_value)
+            self.assertEqual(popen.call_args.args[0][0], "powershell.exe")
+
+    def test_update_ui_exits_immediately_after_starting_installer(self):
+        state = SimpleNamespace(
+            progress=SimpleNamespace(stop=Mock()),
+            destroy=Mock(),
+            write_log=Mock(),
+            _finish_update_download_error=Mock(),
+        )
+        update = SimpleNamespace(version="1.1.13")
+        with patch.object(app.updater, "launch_windows_installer") as launch, patch.object(
+            app.messagebox, "showinfo"
+        ) as showinfo:
+            app.ATSApp._install_downloaded_update(state, update, Path("installer.exe"))
+        launch.assert_called_once_with(Path("installer.exe"))
+        state.destroy.assert_called_once()
+        showinfo.assert_not_called()
 
     def test_deep_diagnostic_can_select_installed_chrome_for_ab_test(self):
         with tempfile.TemporaryDirectory() as temporary:

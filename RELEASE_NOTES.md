@@ -1,3 +1,12 @@
+## Nội dung cập nhật 1.1.13
+
+- Sửa lỗi cập nhật Windows bị Inno Setup báo không ghi đè được
+  `base_library.zip` (Windows error 32). ATS TXL chuyển việc chạy bộ cài cho
+  một tiến trình PowerShell ẩn; tiến trình này chờ ATS TXL thoát hoàn toàn rồi
+  mới mở Inno Setup.
+- Bỏ hộp thoại xác nhận sau khi khởi chạy bộ cài, tránh giữ tiến trình ATS TXL
+  sống trong lúc installer thay thế thư viện đang được ứng dụng sử dụng.
+
 ## Nội dung cập nhật 1.1.12
 
 - Bản vận hành chính thức Windows: chọn **Google Chrome**, **Microsoft Edge**

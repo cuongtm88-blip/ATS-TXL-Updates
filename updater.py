@@ -255,15 +255,36 @@ def launch_windows_replacement(new_exe, work_dir):
 
 
 def launch_windows_installer(installer_path):
-    """Start the Inno Setup installer; it owns replacement of the onedir app."""
+    """Launch Inno Setup only after this application releases its files."""
     if not can_self_update():
         raise UpdateError("Tự cập nhật chỉ hoạt động trong bản đóng gói Windows")
     installer_path = Path(installer_path).resolve()
     if not installer_path.is_file():
         raise UpdateError("Không tìm thấy bộ cài cập nhật đã tải xuống")
+    launcher_dir = installer_path.parent
+    launcher_path = launcher_dir / f"launch-install-{os.getpid()}.ps1"
+    error_log = launcher_dir / "install-launch-error.log"
+    script = f"""$ErrorActionPreference = 'Stop'
+$targetProcessId = {os.getpid()}
+$installerPath = {_powershell_quote(installer_path)}
+$errorLog = {_powershell_quote(error_log)}
+try {{
+    Wait-Process -Id $targetProcessId -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 800
+    Start-Process -FilePath $installerPath -ArgumentList '/SP-','/CLOSEAPPLICATIONS','/RESTARTAPPLICATIONS'
+}} catch {{
+    Add-Content -LiteralPath $errorLog -Value ((Get-Date).ToString('s') + ' ' + $_.Exception.Message)
+}}
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+"""
+    launcher_path.write_text(script, encoding="utf-8-sig")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.Popen(
-        [str(installer_path), "/SP-", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
+    process = subprocess.Popen(
+        [
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-WindowStyle", "Hidden", "-File", str(launcher_path),
+        ],
         close_fds=True,
         creationflags=creationflags,
     )
+    return process
