@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 import shutil
 import zipfile
@@ -100,6 +101,245 @@ GRID_PROBE_FIELDS = (
     "ma_bh", "ghichu_hong", "dienthoai_lh", "ten_trangthai",
     "trangthai_bh", "ten_dv_xl", "ten_dv_dang_th", "ngay_bh",
 )
+ONEBSS_UI_COLUMN_MAPPING = (
+    ("Tỉnh", "tentinh", "mapped", ()),
+    ("Mã thuê bao", "ma_tb", "mapped", ()),
+    ("Tên thuê bao", "ten_tb", "mapped", ()),
+    ("Loại hình TB", "loaihinh_tb", "mapped", ()),
+    ("Đơn vị nhận", "ten_dv", "mapped", ("Đơn vị nhân",)),
+    ("Đơn vị xử lí", "ten_dv_xl", "mapped", ("Đơn vị xử lý",)),
+    ("Đơn vị đang thực hiện", "ten_dv_dang_th", "mapped", ()),
+    ("Ngày báo hỏng", "ngay_bh", "mapped", ()),
+    ("SLA", "sla", "mapped", ()),
+    ("Người giữ phiếu", "ma_nd", "mapped", ()),
+    ("Người báo hỏng", "nguoi_cn", "ambiguous", ()),
+    ("SĐT BH", "dienthoai_bh", "mapped", ()),
+    ("Điện thoại liên hệ", "dienthoai_lh", "mapped", ()),
+    ("Trạng thái bảo hỏng", "trangthai_bh", "mapped", ("Trạng thái báo hỏng",)),
+    ("Nhân viên", "ten_nv", "mapped", ()),
+    ("Nội dung hỏng", "ghichu_hong", "mapped", ()),
+    ("Số ảo", None, "unknown", ()),
+    ("Mã báo hỏng", "ma_bh", "mapped", ()),
+    ("Kênh tiếp nhận", "kenh_tn", "mapped", ()),
+    ("Địa chỉ lắp đặt", "diachi_ld", "mapped", ()),
+    ("Máy cập nhật", "may_cn", "mapped", ()),
+    ("Ngày cập nhật", "ngay_cn", "mapped", ()),
+    ("Người cập nhật", "nguoi_cn", "mapped", ()),
+    ("Quy trình", "ten_quytrinh", "mapped", ()),
+    ("Trạng thái xử lý", "ten_trangthai", "mapped", ()),
+)
+
+
+def _normalize_onebss_header(value):
+    """Normalize a visible OneBSS header for alias lookup only."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(unicodedata.normalize("NFC", value).casefold().split())
+
+
+def _onebss_header_alias_map():
+    aliases = {}
+    for canonical_header, _field, _status, extra_aliases in ONEBSS_UI_COLUMN_MAPPING:
+        for label in (canonical_header, *extra_aliases):
+            aliases[_normalize_onebss_header(label)] = canonical_header
+    return aliases
+
+
+ONEBSS_HEADER_ALIASES = _onebss_header_alias_map()
+
+
+def _onebss_mapping_status():
+    return [
+        {
+            "ui_header": header,
+            "canonical_field": field,
+            "status": status,
+        }
+        for header, field, status, _aliases in ONEBSS_UI_COLUMN_MAPPING
+    ]
+
+
+class OneBSSGridReadError(RuntimeError):
+    """A grid snapshot failed validation; metadata contains no row values."""
+
+    def __init__(self, metadata):
+        self.metadata = metadata
+        super().__init__("OneBSS grid data failed validation")
+
+
+def _parse_onebss_grid_snapshot(snapshot):
+    """Map a metadata-described grid snapshot without relying on column order."""
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    detected_headers = snapshot.get("detected_headers")
+    detected_headers = detected_headers if isinstance(detected_headers, list) else []
+    rows = snapshot.get("rows")
+    rows = rows if isinstance(rows, list) else []
+    total_count = snapshot.get("total_count")
+    if not isinstance(total_count, int) or isinstance(total_count, bool) or total_count < 0:
+        total_count = None
+
+    header_to_source = {}
+    duplicate_headers = []
+    for raw_header in detected_headers:
+        canonical_header = ONEBSS_HEADER_ALIASES.get(_normalize_onebss_header(raw_header))
+        if canonical_header is None:
+            continue
+        if canonical_header in header_to_source:
+            duplicate_headers.append(canonical_header)
+        else:
+            header_to_source[canonical_header] = raw_header
+
+    expected_headers = [item[0] for item in ONEBSS_UI_COLUMN_MAPPING]
+    missing_headers = [header for header in expected_headers if header not in header_to_source]
+    mapping_status = _onebss_mapping_status()
+    row_count = len(rows)
+    ui_records = []
+    canonical_records = []
+    missing_ma_bh_count = 0
+    missing_cell_count = 0
+    ma_bh_frequency = {}
+
+    for source_row in rows:
+        source_row = source_row if isinstance(source_row, dict) else {}
+        missing_cell_count += sum(
+            header not in header_to_source
+            or header_to_source[header] not in source_row
+            for header in expected_headers
+        )
+        ui_record = {
+            header: source_row.get(header_to_source[header])
+            if header in header_to_source else None
+            for header in expected_headers
+        }
+        key = ui_record.get("Mã báo hỏng")
+        key = unicodedata.normalize("NFC", str(key)).strip() if key is not None else ""
+        if not key:
+            missing_ma_bh_count += 1
+        else:
+            ma_bh_frequency[key] = ma_bh_frequency.get(key, 0) + 1
+
+        canonical_record = {}
+        for header, field, status, _aliases in ONEBSS_UI_COLUMN_MAPPING:
+            # Ambiguous and unknown mappings remain preserved in ui_record,
+            # but are deliberately not collapsed into canonical fields.
+            if status == "mapped" and field:
+                canonical_record[field] = ui_record[header]
+        ui_records.append(ui_record)
+        canonical_records.append(canonical_record)
+
+    duplicate_ma_bh_count = sum(count - 1 for count in ma_bh_frequency.values() if count > 1)
+    unique_ma_bh_count = len(ma_bh_frequency)
+    row_count_matches = total_count is not None and row_count == total_count
+    unique_count_matches = total_count is not None and unique_ma_bh_count == total_count
+    invariants = {
+        "required_headers_present": not missing_headers and not duplicate_headers,
+        "all_ui_cells_present": missing_cell_count == 0,
+        "row_count_matches_total": row_count_matches,
+        "unique_ma_bh_matches_total": unique_count_matches,
+        "duplicate_ma_bh_count_zero": duplicate_ma_bh_count == 0,
+        "missing_ma_bh_count_zero": missing_ma_bh_count == 0,
+    }
+    metadata = {
+        "total_count": total_count,
+        "row_count": row_count,
+        "unique_ma_bh_count": unique_ma_bh_count,
+        "duplicate_ma_bh_count": duplicate_ma_bh_count,
+        "missing_ma_bh_count": missing_ma_bh_count,
+        "missing_cell_count": missing_cell_count,
+        "detected_headers": [
+            " ".join(str(value).split())[:120]
+            for value in detected_headers if isinstance(value, str)
+        ][:80],
+        "missing_headers": missing_headers,
+        "duplicate_headers": sorted(set(duplicate_headers)),
+        "mapping_status": mapping_status,
+        "invariants": invariants,
+        "result": "PASS" if all(invariants.values()) else "FAIL",
+    }
+    if metadata["result"] != "PASS":
+        raise OneBSSGridReadError(metadata)
+    return {
+        "ui_records": ui_records,
+        "canonical_records": canonical_records,
+        "metadata": metadata,
+    }
+
+
+ONEBSS_GRID_READ_SCRIPT = r"""() => {
+    const norm = value => typeof value === 'string'
+        ? value.normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase() : '';
+    const gridRoots = [...document.querySelectorAll('.e-grid, [role="grid"]')];
+    const root = gridRoots.find(element => {
+        const headers = [...element.querySelectorAll('th,[role="columnheader"]')]
+            .map(node => norm(node.textContent));
+        return headers.some(header => header.includes(norm('Mã thuê bao'))) &&
+            headers.some(header => header.includes(norm('Mã báo hỏng')));
+    }) || null;
+    if (!root) return {total_count: null, detected_headers: [], rows: []};
+
+    const gridInstance = root.ej2_instances?.find(instance =>
+        typeof instance.getColumns === 'function' &&
+        typeof instance.getRowObjectFromUID === 'function'
+    ) || null;
+    let columns = [];
+    if (gridInstance) {
+        try {
+            columns = gridInstance.getColumns().map(column => ({
+                header: typeof column.headerText === 'string' ? column.headerText.trim() : '',
+                field: typeof column.field === 'string' ? column.field : '',
+                visible: column.visible !== false,
+            })).filter(column => column.header);
+        } catch (_) { columns = []; }
+    }
+    if (!columns.length) {
+        columns = [...root.querySelectorAll('th,[role="columnheader"]')]
+            .map(node => ({header: (node.textContent || '').trim(), field: '', visible: true}))
+            .filter(column => column.header);
+    }
+    const detectedHeaders = columns.map(column => column.header);
+    const tables = [...root.querySelectorAll('table')];
+    const contentTable = tables.map(table => ({table, rows: [...table.querySelectorAll('tbody tr')]
+        .filter(row => row.querySelectorAll('td').length > 0 && row.closest('.e-grid') === root &&
+            !row.matches('.e-filterbar, .e-emptyrow, .e-summaryrow, [aria-hidden="true"]'))}))
+        .sort((a, b) => b.rows.length - a.rows.length)[0];
+    const domRows = contentTable?.rows || [];
+    const pager = root.querySelector('.e-pager, [class*="pager"]');
+    const totalText = pager?.textContent || '';
+    const totalMatch = totalText.match(/Tổng cộng\s*(\d+)\s*bản ghi/i);
+    const totalCount = totalMatch ? Number(totalMatch[1]) : null;
+    const rows = domRows.map(row => {
+        let raw = null;
+        if (gridInstance) {
+            try {
+                const uid = row.getAttribute('data-uid');
+                raw = uid ? gridInstance.getRowObjectFromUID(uid)?.data : null;
+            } catch (_) {}
+        }
+        const cells = [...row.querySelectorAll('td,[role="gridcell"]')];
+        const cellByAriaIndex = new Map(cells.map(cell => [
+            cell.getAttribute('aria-colindex'), cell
+        ]).filter(([index]) => index));
+        const result = {};
+        columns.forEach((column, index) => {
+            if (raw && column.field && Object.prototype.hasOwnProperty.call(raw, column.field)) {
+                result[column.header] = raw[column.field];
+                return;
+            }
+            const headerNode = [...root.querySelectorAll('th,[role="columnheader"]')]
+                .find(node => norm(node.textContent) === norm(column.header));
+            const ariaIndex = headerNode?.getAttribute('aria-colindex');
+            let cell = ariaIndex ? cellByAriaIndex.get(ariaIndex) : null;
+            // Fallback uses the current grid's column metadata order, never a
+            // hard-coded business-field position.
+            if (!cell && cells.length === columns.length) cell = cells[index];
+            if (cell) result[column.header] = cell.innerText ?? cell.textContent ?? '';
+        });
+        return result;
+    });
+    return {total_count: totalCount, detected_headers: detectedHeaders, rows};
+}"""
+
+
 GRID_PROBE_SCRIPT = r"""(atsFields) => {
     const cleanName = value => typeof value === 'string' &&
         /^[A-Za-z_$][A-Za-z0-9_$.-]{0,79}$/.test(value) ? value : '';
@@ -2951,6 +3191,45 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             f"Tệp metadata: {report}"
         )
 
+    def _read_onebss_grid(self, page):
+        """Read and validate all grid rows; row values remain in memory only."""
+        snapshot = page.evaluate(ONEBSS_GRID_READ_SCRIPT)
+        return _parse_onebss_grid_snapshot(snapshot)
+
+    def _run_onebss_grid_diagnostic(self, page):
+        """Run the data reader in isolation and persist only aggregate metadata."""
+        try:
+            result = self._read_onebss_grid(page)
+            metadata = result["metadata"]
+        except OneBSSGridReadError as exc:
+            metadata = exc.metadata
+        except Exception as exc:
+            try:
+                _parse_onebss_grid_snapshot({})
+            except OneBSSGridReadError as parse_exc:
+                metadata = parse_exc.metadata
+            metadata["reader_error_type"] = type(exc).__name__
+
+        folder = APP_DATA / DIAGNOSTICS_DIRNAME / (
+            f"grid_data_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        )
+        folder.mkdir(parents=True, exist_ok=False)
+        report = folder / "onebss-grid-diagnostic.json"
+        report.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._last_diagnostic_path = folder
+        self.write_log(
+            "OneBSS grid reader "
+            f"{metadata['result']}: total={metadata['total_count']}, "
+            f"rows={metadata['row_count']}, unique ma_bh={metadata['unique_ma_bh_count']}, "
+            f"duplicates={metadata['duplicate_ma_bh_count']}, "
+            f"missing ma_bh={metadata['missing_ma_bh_count']}."
+        )
+        raise DiagnosticTestCompleted(
+            f"OneBSS grid data diagnostic {metadata['result']}; "
+            "không chạy Test D, Export Excel hoặc Telegram. "
+            f"Metadata: {report}"
+        )
+
     def _export_excel(self, page, context):
         if page.is_closed():
             raise RuntimeError("Trình duyệt đã đóng. Hãy bấm nút 1 để mở lại OneBSS.")
@@ -3023,7 +3302,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             page.get_by_text("Tìm kiếm", exact=True).click(timeout=15000)
             self._wait_for_search_complete(page)
             if probe_only:
-                self._probe_result_grid(page)
+                self._run_onebss_grid_diagnostic(page)
             self.write_log("Bấm Xuất Excel...")
             page.evaluate("""() => {
                 window.__atsTxlExportCapture = {armed: true, blobUrl: null};

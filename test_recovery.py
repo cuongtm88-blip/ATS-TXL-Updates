@@ -16,7 +16,164 @@ import diagnostics_upload
 import updater
 
 
+def fake_onebss_grid_snapshot(total_count=2):
+    headers = [mapping[0] for mapping in app.ONEBSS_UI_COLUMN_MAPPING]
+    rows = []
+    for number in range(1, 3):
+        row = {header: f"FAKE-{header}-{number}" for header in headers}
+        row["Mã báo hỏng"] = f"FAKE-ID-{number}"
+        row["Số ảo"] = f"FAKE-VIRTUAL-{number}"
+        rows.append(row)
+    return {"total_count": total_count, "detected_headers": headers, "rows": rows}
+
+
 class RecoveryTests(unittest.TestCase):
+    def test_onebss_grid_reader_maps_all_25_headers(self):
+        parsed = app._parse_onebss_grid_snapshot(fake_onebss_grid_snapshot())
+
+        self.assertEqual(len(parsed["ui_records"]), 2)
+        self.assertEqual(len(parsed["ui_records"][0]), 25)
+        self.assertEqual(len(parsed["canonical_records"]), 2)
+        self.assertEqual(parsed["metadata"]["result"], "PASS")
+        self.assertEqual(parsed["metadata"]["unique_ma_bh_count"], 2)
+        self.assertEqual(parsed["canonical_records"][0]["ma_bh"], "FAKE-ID-1")
+        self.assertEqual(
+            set(parsed["canonical_records"][0]),
+            {
+                "tentinh", "ma_tb", "ten_tb", "loaihinh_tb", "ten_dv", "ten_dv_xl",
+                "ten_dv_dang_th", "ngay_bh", "sla", "ma_nd", "dienthoai_bh",
+                "dienthoai_lh", "trangthai_bh", "ten_nv", "ghichu_hong", "ma_bh",
+                "kenh_tn", "diachi_ld", "may_cn", "ngay_cn", "nguoi_cn",
+                "ten_quytrinh", "ten_trangthai",
+            },
+        )
+
+    def test_onebss_grid_reader_resolves_header_aliases_after_reordering(self):
+        snapshot = fake_onebss_grid_snapshot()
+        aliases = {
+            "Đơn vị nhận": "Đơn vị nhân",
+            "Đơn vị xử lí": "Đơn vị xử lý",
+            "Trạng thái bảo hỏng": "Trạng thái báo hỏng",
+        }
+        snapshot["detected_headers"] = [
+            aliases.get(header, header) for header in reversed(snapshot["detected_headers"])
+        ]
+        snapshot["rows"] = [
+            {aliases.get(header, header): value for header, value in reversed(row.items())}
+            for row in snapshot["rows"]
+        ]
+
+        parsed = app._parse_onebss_grid_snapshot(snapshot)
+
+        self.assertEqual(parsed["metadata"]["result"], "PASS")
+        self.assertEqual(parsed["ui_records"][0]["Đơn vị nhận"], "FAKE-Đơn vị nhận-1")
+        self.assertEqual(parsed["ui_records"][0]["Đơn vị xử lí"], "FAKE-Đơn vị xử lí-1")
+        self.assertEqual(parsed["ui_records"][0]["Trạng thái bảo hỏng"], "FAKE-Trạng thái bảo hỏng-1")
+
+    def test_onebss_grid_reader_fails_on_missing_header(self):
+        snapshot = fake_onebss_grid_snapshot()
+        missing = "Tỉnh"
+        snapshot["detected_headers"].remove(missing)
+
+        with self.assertRaises(app.OneBSSGridReadError) as raised:
+            app._parse_onebss_grid_snapshot(snapshot)
+
+        self.assertEqual(raised.exception.metadata["result"], "FAIL")
+        self.assertIn(missing, raised.exception.metadata["missing_headers"])
+
+    def test_onebss_grid_reader_fails_on_duplicate_ma_bh(self):
+        snapshot = fake_onebss_grid_snapshot()
+        snapshot["rows"][1]["Mã báo hỏng"] = snapshot["rows"][0]["Mã báo hỏng"]
+
+        with self.assertRaises(app.OneBSSGridReadError) as raised:
+            app._parse_onebss_grid_snapshot(snapshot)
+
+        self.assertEqual(raised.exception.metadata["duplicate_ma_bh_count"], 1)
+        self.assertFalse(raised.exception.metadata["invariants"]["duplicate_ma_bh_count_zero"])
+
+    def test_onebss_grid_reader_fails_on_missing_ma_bh(self):
+        snapshot = fake_onebss_grid_snapshot()
+        snapshot["rows"][0]["Mã báo hỏng"] = "  "
+
+        with self.assertRaises(app.OneBSSGridReadError) as raised:
+            app._parse_onebss_grid_snapshot(snapshot)
+
+        self.assertEqual(raised.exception.metadata["missing_ma_bh_count"], 1)
+        self.assertFalse(raised.exception.metadata["invariants"]["missing_ma_bh_count_zero"])
+
+    def test_onebss_grid_reader_fails_when_row_count_differs_from_total(self):
+        snapshot = fake_onebss_grid_snapshot(total_count=3)
+
+        with self.assertRaises(app.OneBSSGridReadError) as raised:
+            app._parse_onebss_grid_snapshot(snapshot)
+
+        self.assertFalse(raised.exception.metadata["invariants"]["row_count_matches_total"])
+
+    def test_onebss_grid_reader_fails_when_unique_key_count_differs_from_total(self):
+        snapshot = fake_onebss_grid_snapshot()
+        snapshot["rows"][1]["Mã báo hỏng"] = snapshot["rows"][0]["Mã báo hỏng"]
+
+        with self.assertRaises(app.OneBSSGridReadError) as raised:
+            app._parse_onebss_grid_snapshot(snapshot)
+
+        self.assertFalse(raised.exception.metadata["invariants"]["unique_ma_bh_matches_total"])
+
+    def test_onebss_grid_reader_preserves_both_person_values_without_overwrite(self):
+        snapshot = fake_onebss_grid_snapshot()
+        snapshot["rows"][0]["Người báo hỏng"] = "FAKE-REPORTER"
+        snapshot["rows"][0]["Người cập nhật"] = "FAKE-UPDATER"
+
+        parsed = app._parse_onebss_grid_snapshot(snapshot)
+
+        ui_record = parsed["ui_records"][0]
+        canonical = parsed["canonical_records"][0]
+        self.assertEqual(ui_record["Người báo hỏng"], "FAKE-REPORTER")
+        self.assertEqual(ui_record["Người cập nhật"], "FAKE-UPDATER")
+        self.assertEqual(canonical["nguoi_cn"], "FAKE-UPDATER")
+        self.assertEqual(
+            parsed["metadata"]["mapping_status"][10]["status"], "ambiguous"
+        )
+
+    def test_onebss_grid_reader_preserves_unknown_so_ao_only_in_ui_record(self):
+        parsed = app._parse_onebss_grid_snapshot(fake_onebss_grid_snapshot())
+
+        self.assertEqual(parsed["ui_records"][0]["Số ảo"], "FAKE-VIRTUAL-1")
+        self.assertNotIn("Số ảo", parsed["canonical_records"][0])
+        self.assertEqual(
+            parsed["metadata"]["mapping_status"][16]["status"], "unknown"
+        )
+
+    def test_onebss_grid_diagnostic_metadata_never_contains_row_values(self):
+        parsed = app._parse_onebss_grid_snapshot(fake_onebss_grid_snapshot())
+        serialized = json.dumps(parsed["metadata"], ensure_ascii=False)
+
+        self.assertNotIn("FAKE-ID-1", serialized)
+        self.assertNotIn("FAKE-VIRTUAL-1", serialized)
+        self.assertEqual(parsed["metadata"]["result"], "PASS")
+
+    def test_onebss_grid_diagnostic_file_and_log_contain_metadata_only(self):
+        state = app.ATSApp.__new__(app.ATSApp)
+        state.write_log = Mock()
+        state._last_diagnostic_path = None
+        page = Mock()
+        page.evaluate.return_value = fake_onebss_grid_snapshot()
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            app, "APP_DATA", Path(temporary)
+        ):
+            with self.assertRaises(app.DiagnosticTestCompleted):
+                state._run_onebss_grid_diagnostic(page)
+            report = state._last_diagnostic_path / "onebss-grid-diagnostic.json"
+            serialized = report.read_text(encoding="utf-8")
+
+        self.assertNotIn("FAKE-ID-1", serialized)
+        self.assertNotIn("FAKE-VIRTUAL-1", serialized)
+        self.assertNotIn("FAKE-Đơn vị nhận-1", serialized)
+        log_text = " ".join(str(call.args[0]) for call in state.write_log.call_args_list)
+        self.assertNotIn("FAKE-ID-1", log_text)
+        self.assertNotIn("FAKE-VIRTUAL-1", log_text)
+        self.assertIn('"result": "PASS"', serialized)
+
     def test_grid_probe_sanitizer_keeps_only_schema_metadata(self):
         customer_value = "CUSTOMER-ROW-VALUE-MUST-NOT-LEAK"
         raw = {
@@ -91,15 +248,16 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(page.evaluate.call_args.args[0], app.GRID_PROBE_SCRIPT)
         self.assertTrue(all(field in serialized for field in app.GRID_PROBE_FIELDS))
 
-    def test_deep_diagnostic_grid_probe_stops_before_test_d_and_export(self):
+    def test_deep_diagnostic_grid_reader_stops_before_old_probe_test_d_and_export(self):
         state = app.ATSApp.__new__(app.ATSApp)
         state.deep_diagnostic_mode = True
         state._last_diagnostic_path = None
         state._ensure_onebss_session_active = Mock()
         state._wait_for_search_complete = Mock()
-        state._probe_result_grid = Mock(
+        state._run_onebss_grid_diagnostic = Mock(
             side_effect=app.DiagnosticTestCompleted("probe complete")
         )
+        state._probe_result_grid = Mock()
         state._run_export_test_d = Mock()
         state._finish_export_diagnostic = Mock()
         state.write_log = Mock()
@@ -111,7 +269,8 @@ class RecoveryTests(unittest.TestCase):
             app.ATSApp._export_excel(state, page, context)
 
         page.get_by_text.assert_called_once_with("Tìm kiếm", exact=True)
-        state._probe_result_grid.assert_called_once_with(page)
+        state._run_onebss_grid_diagnostic.assert_called_once_with(page)
+        state._probe_result_grid.assert_not_called()
         state._run_export_test_d.assert_not_called()
         state._finish_export_diagnostic.assert_not_called()
 
