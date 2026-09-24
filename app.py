@@ -94,41 +94,87 @@ LEGACY_BROWSER_CHOICES = {
 ONEBSS_EXPIRY_WARNING_SECONDS = 15 * 60
 MAX_EXCEL_CAPTURE_BYTES = 100 * 1024 * 1024
 TEST_D_CHUNK_BYTES = 512 * 1024
-TEST_D_HOOK_SCRIPT = r"""() => {
-    if (location.hostname !== 'onebss.vnpt.vn' || window.__atsTxlTestD) return false;
+TEST_D_HOOK_VERSION = '1.1.20-diagnostic'
+TEST_D_HOOK_SCRIPT = r"""(options) => {
+    const {frameId = 'frame-unassigned', observeOnly = false} = options || {};
+    if (location.origin !== 'https://onebss.vnpt.vn' || window.__atsTxlTestD) return false;
     const nativeCreate = URL.createObjectURL;
+    const nativeRevoke = URL.revokeObjectURL;
     const nativeClick = HTMLAnchorElement.prototype.click;
+    const nativeOpen = window.open;
+    const documentId = 'document-' + Math.random().toString(36).slice(2);
     const state = {
         armed: false, clickedAt: 0, blobs: new Map(), candidate: null,
-        suppressedCount: 0, multipleCandidates: false
+        suppressedCount: 0, multipleCandidates: false, listenerInstalled: false,
+        nextBlobId: 1
     };
+    const emit = (eventType, fields = {}) => {
+        // The binding receives only fixed metadata; never send URLs or Blob bytes.
+        try { void window.__atsTxlTestDEvent?.({event_type: eventType, frame_id: frameId,
+            document_id: documentId, js_timestamp: new Date().toISOString(), ...fields}); } catch (_) {}
+    };
+    const mimeCategory = blob => {
+        const mime = (blob?.type || '').toLowerCase();
+        if (!mime) return 'empty';
+        if (mime === 'application/octet-stream') return 'octet-stream';
+        if (mime === 'application/zip') return 'zip';
+        if (/(excel|spreadsheet|sheet)/.test(mime)) return 'excel';
+        return 'other';
+    };
+    const verify = () => ({
+        version: '1.1.20-diagnostic', frame_id: frameId, document_id: documentId,
+        origin: location.origin, observe_only: observeOnly,
+        create_wrapped: URL.createObjectURL === wrappedCreate,
+        click_wrapped: HTMLAnchorElement.prototype.click === wrappedClick,
+        listener_installed: state.listenerInstalled, blob_map_exists: state.blobs instanceof Map,
+        armed: state.armed
+    });
     const metadata = () => ({
         state: state.candidate ? 'captured' : state.armed ? 'armed' : 'installed',
-        filename: state.candidate?.filename || '',
-        mime_type: state.candidate?.blob.type || '',
+        filename_extension: state.candidate ? '.xlsx' : '',
+        mime_category: mimeCategory(state.candidate?.blob),
         blob_size: state.candidate?.blob.size || 0,
         captured_at: state.candidate?.capturedAt || '',
         suppressed_count: state.suppressedCount,
         multiple_candidates: state.multipleCandidates
     });
-    const candidateFor = anchor => {
-        if (!state.armed || !state.clickedAt || !(anchor instanceof HTMLAnchorElement)) return null;
-        const filename = anchor.download || '';
-        // The filename must be unambiguous; MIME may be blank or octet-stream.
-        if (!/^[^\\/\x00-\x1f]{1,160}\.xlsx$/i.test(filename)) return null;
-        const url = anchor.href;
-        if (!url.startsWith('blob:' + location.origin + '/')) return null;
+    const candidateFor = (anchor, path) => {
+        const isAnchor = anchor instanceof HTMLAnchorElement;
+        const filename = isAnchor ? anchor.download || '' : '';
+        const url = isAnchor ? anchor.href : '';
         const entry = state.blobs.get(url);
-        if (!entry || entry.createdAt < state.clickedAt ||
-            Date.now() - state.clickedAt > 60000 || entry.blob.size < 1) return null;
-        const mime = entry.blob.type.toLowerCase();
-        if (mime && mime !== 'application/octet-stream' &&
-            mime !== 'application/zip' && !/(excel|spreadsheet|sheet)/.test(mime)) return null;
-        return {url, filename, blob: entry.blob};
+        const ageMs = entry ? Date.now() - entry.createdAt : null;
+        const signals = {
+            path, armed: state.armed, href_blob: url.startsWith('blob:'),
+            blob_in_map: !!entry, blob_age_ms: ageMs,
+            filename_extension: filename.toLowerCase().endsWith('.xlsx') ? '.xlsx' :
+                /\.(xls|csv|pdf|zip)$/i.test(filename) ? '.' + filename.split('.').pop().toLowerCase() : '.other',
+            filename_valid: /^[^\\/\x00-\x1f]{1,160}\.xlsx$/i.test(filename),
+            mime_category: mimeCategory(entry?.blob), blob_size: entry?.blob.size || 0,
+            onebss_origin: location.origin === 'https://onebss.vnpt.vn',
+            duplicate: !!state.candidate && state.candidate.url === url,
+            export_timing_window: !!state.clickedAt && Date.now() - state.clickedAt <= 60000,
+            blob_id: entry?.id || ''
+        };
+        let reason = '';
+        if (!state.armed || !state.clickedAt) reason = 'NOT_ARMED';
+        else if (!isAnchor || !url.startsWith('blob:')) reason = 'NOT_BLOB_URL';
+        else if (!signals.onebss_origin || !url.startsWith('blob:' + location.origin + '/')) reason = 'WRONG_ORIGIN';
+        else if (!signals.filename_valid) reason = 'FILENAME_NOT_XLSX';
+        else if (!entry) reason = 'BLOB_NOT_IN_MAP';
+        else if (entry.createdAt < state.clickedAt) reason = 'BLOB_TOO_OLD';
+        else if (!signals.export_timing_window) reason = 'EXPORT_WINDOW_EXPIRED';
+        else if (entry.blob.size < 1) reason = 'SIZE_INVALID';
+        else if (signals.mime_category === 'other') reason = 'MIME_REJECTED';
+        emit('CANDIDATE EVALUATED', {...signals, decision: reason ? 'ALLOW' :
+            observeOnly ? 'ALLOW' : 'SUPPRESS', reason_code: reason ||
+            (observeOnly ? 'OBSERVE_ONLY_FRAME' : state.candidate && state.candidate.url !== url ?
+                'MULTIPLE_CANDIDATES' : signals.duplicate ? 'DUPLICATE' : 'MATCH')});
+        return reason ? null : {url, blob: entry.blob};
     };
-    const capture = anchor => {
-        const candidate = candidateFor(anchor);
-        if (!candidate) return false;
+    const capture = (anchor, path) => {
+        const candidate = candidateFor(anchor, path);
+        if (!candidate || observeOnly) return false;
         if (state.candidate && state.candidate.url !== candidate.url) {
             state.multipleCandidates = true;
         } else if (!state.candidate) {
@@ -140,25 +186,48 @@ TEST_D_HOOK_SCRIPT = r"""() => {
     const wrappedCreate = function(...args) {
         const url = nativeCreate.apply(this, args);
         if (state.armed && args[0] instanceof Blob) {
-            state.blobs.set(url, {blob: args[0], createdAt: Date.now()});
+            const id = 'blob-' + state.nextBlobId++;
+            state.blobs.set(url, {blob: args[0], createdAt: Date.now(), id});
+            emit('CREATE_OBJECT_URL', {blob_id: id, blob_size: args[0].size,
+                mime_category: mimeCategory(args[0]), armed: state.armed});
         }
         return url;
     };
+    const wrappedRevoke = function(url) {
+        const entry = state.blobs.get(url);
+        if (entry) emit('REVOKE_OBJECT_URL', {blob_id: entry.id, armed: state.armed});
+        return nativeRevoke.apply(this, arguments);
+    };
     const wrappedClick = function(...args) {
-        if (capture(this)) return;
+        emit('ANCHOR_CLICK', {href_blob: this.href.startsWith('blob:'),
+            blob_id: state.blobs.get(this.href)?.id || '', armed: state.armed});
+        if (capture(this, 'anchor.click')) return;
         return nativeClick.apply(this, args);
     };
     const onClick = event => {
         const anchor = event.target instanceof Element ? event.target.closest('a') : null;
-        if (capture(anchor)) {
+        if (!anchor) return;
+        emit('CAPTURE_CLICK_EVENT', {href_blob: anchor.href.startsWith('blob:'),
+            blob_id: state.blobs.get(anchor.href)?.id || '', armed: state.armed});
+        if (capture(anchor, 'capture-click-event')) {
             event.preventDefault();
             event.stopImmediatePropagation();
         }
     };
+    const wrappedOpen = function(url, ...args) {
+        if (typeof url === 'string' && url.startsWith('blob:')) {
+            emit('WINDOW_OPEN_BLOB', {blob_id: state.blobs.get(url)?.id || '', armed: state.armed});
+        }
+        return nativeOpen.call(this, url, ...args);
+    };
     URL.createObjectURL = wrappedCreate;
+    URL.revokeObjectURL = wrappedRevoke;
     HTMLAnchorElement.prototype.click = wrappedClick;
+    window.open = wrappedOpen;
     document.addEventListener('click', onClick, true);
+    state.listenerInstalled = true;
     window.__atsTxlTestD = {
+        verify,
         arm() { state.armed = true; return true; },
         markExportClick() { state.clickedAt = Date.now(); return true; },
         metadata,
@@ -178,10 +247,13 @@ TEST_D_HOOK_SCRIPT = r"""() => {
         cleanup() {
             state.armed = false;
             document.removeEventListener('click', onClick, true);
+            state.listenerInstalled = false;
             if (URL.createObjectURL === wrappedCreate) URL.createObjectURL = nativeCreate;
+            if (URL.revokeObjectURL === wrappedRevoke) URL.revokeObjectURL = nativeRevoke;
             if (HTMLAnchorElement.prototype.click === wrappedClick) {
                 HTMLAnchorElement.prototype.click = nativeClick;
             }
+            if (window.open === wrappedOpen) window.open = nativeOpen;
             state.blobs.clear();
             state.candidate = null;
             delete window.__atsTxlTestD;
@@ -1416,6 +1488,12 @@ class ATSApp(tk.Tk):
             return
         event.setdefault("timestamp", time.strftime("%Y-%m-%dT%H:%M:%S%z"))
         active.setdefault("network_events", []).append(event)
+        evidence = active.get("test_d_evidence_dir")
+        if evidence:
+            with (evidence / "export-network-events.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
 
     def _record_network_request(self, context, request):
         active = self._active_export_diagnostic
@@ -2038,7 +2116,9 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             return None
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        folder = APP_DATA / DIAGNOSTICS_DIRNAME / f"export_{timestamp}_{active['id']}"
+        folder = active.get("test_d_evidence_dir") or (
+            APP_DATA / DIAGNOSTICS_DIRNAME / f"export_{timestamp}_{active['id']}"
+        )
         folder.mkdir(parents=True, exist_ok=True)
         dump_paths = []
         if sys.platform == "win32":
@@ -2127,9 +2207,10 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
         (folder / "browser-events.json").write_text(
             json.dumps(active["events"], ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        with (folder / "export-network-events.jsonl").open("w", encoding="utf-8") as stream:
-            for event in active.get("network_events", []):
-                stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        if not active.get("test_d_evidence_dir"):
+            with (folder / "export-network-events.jsonl").open("w", encoding="utf-8") as stream:
+                for event in active.get("network_events", []):
+                    stream.write(json.dumps(event, ensure_ascii=False) + "\n")
         (folder / "windows-events.json").write_text(
             self._windows_crash_events(), encoding="utf-8"
         )
@@ -2934,14 +3015,160 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             temporary.unlink(missing_ok=True)
 
     @staticmethod
+    def _test_d_hook_verified(verification, frame_id, armed, observe_only=False):
+        return bool(
+            isinstance(verification, dict)
+            and verification.get("version") == TEST_D_HOOK_VERSION
+            and verification.get("frame_id") == frame_id
+            and str(verification.get("document_id", "")).startswith("document-")
+            and verification.get("origin") == ONEBSS_URL.rstrip("/")
+            and verification.get("observe_only") is observe_only
+            and verification.get("create_wrapped") is True
+            and verification.get("click_wrapped") is True
+            and verification.get("listener_installed") is True
+            and verification.get("blob_map_exists") is True
+            and verification.get("armed") is armed
+        )
+
+    def _test_d_js_event(self, context, source, payload):
+        """Accept only bounded, allowlisted telemetry; never persist a page-supplied URL."""
+        active = self._active_export_diagnostic
+        if not active or active.get("context") is not context or not isinstance(payload, dict):
+            return
+        event_type = payload.get("event_type")
+        if event_type not in {
+            "CREATE_OBJECT_URL", "REVOKE_OBJECT_URL", "ANCHOR_CLICK",
+            "CAPTURE_CLICK_EVENT", "WINDOW_OPEN_BLOB", "CANDIDATE EVALUATED",
+        }:
+            return
+        frame_id = active.get("test_d_frame_ids", {}).get(id(source.get("frame")), "unknown")
+        item = next((item for item in active.get("test_d_frame_inventory", [])
+                     if item.get("frame_id") == frame_id), {})
+        fields = {"frame_id": frame_id, "document_id": item.get("document_id", "")}
+        allowed = {
+            "path": {"anchor.click", "capture-click-event"},
+            "filename_extension": {"", ".xlsx", ".xls", ".csv", ".pdf", ".zip", ".other"},
+            "mime_category": {"empty", "octet-stream", "zip", "excel", "other"},
+            "reason_code": {"NOT_ARMED", "NOT_BLOB_URL", "BLOB_NOT_IN_MAP", "BLOB_TOO_OLD",
+                            "FILENAME_NOT_XLSX", "MIME_REJECTED", "SIZE_INVALID", "WRONG_ORIGIN",
+                            "DUPLICATE", "MULTIPLE_CANDIDATES", "EXPORT_WINDOW_EXPIRED",
+                            "OBSERVE_ONLY_FRAME", "MATCH", "OTHER"},
+        }
+        for key, choices in allowed.items():
+            if isinstance(payload.get(key), str) and payload[key] in choices:
+                fields[key] = payload[key]
+        blob_id = payload.get("blob_id")
+        if isinstance(blob_id, str) and re.fullmatch(r"blob-\d{1,10}", blob_id):
+            fields["blob_id"] = blob_id
+        if payload.get("decision") in ("ALLOW", "SUPPRESS"):
+            fields["candidate_decision"] = payload["decision"]
+        stamp = payload.get("js_timestamp")
+        if isinstance(stamp, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", stamp):
+            fields["js_timestamp"] = stamp
+        for key in ("armed", "href_blob", "blob_in_map", "filename_valid",
+                    "onebss_origin", "duplicate", "export_timing_window"):
+            if type(payload.get(key)) is bool:
+                fields[key] = payload[key]
+        for key in ("blob_size", "blob_age_ms"):
+            value = payload.get(key)
+            if type(value) is int and 0 <= value <= 2**40:
+                fields[key] = value
+        self._record_network_event(context, event_type=event_type, decision="observed", **fields)
+
+    def _test_d_inventory_frames(self, page, context, active):
+        frames = list(page.frames)
+        ids = {id(frame): f"frame-{index + 1}" for index, frame in enumerate(frames)}
+        active["test_d_frame_ids"] = ids
+        inventory = []
+        for frame in frames:
+            frame_id = ids[id(frame)]
+            parent = frame.parent_frame
+            url = frame.url
+            parts = urlsplit(url)
+            frame_url = (
+                f"{parts.scheme}://{parts.hostname}/[PATH_REDACTED]"
+                if parts.scheme in ("http", "https") and parts.hostname
+                else f"{parts.scheme}:[REDACTED]"
+            )
+            item = {
+                "frame_id": frame_id,
+                "parent_frame_id": ids.get(id(parent), "") if parent else "",
+                "main_frame": frame is page.main_frame,
+                "origin": "",
+                "url": frame_url,
+                "attached": not frame.is_detached(),
+                "instrumented": False,
+            }
+            try:
+                item["origin"] = frame.evaluate("() => location.origin")
+            except Exception:
+                item["not_instrumented_reason"] = "ORIGIN_UNREADABLE"
+            inventory.append(item)
+            self._record_network_event(context, event_type="FRAME INVENTORY",
+                                       frame_id=frame_id, main_frame=item["main_frame"],
+                                       origin=item["origin"] if item["origin"] == ONEBSS_URL.rstrip("/") else "other",
+                                       attached=item["attached"], decision="observed")
+        return frames, inventory
+
+    @staticmethod
+    def _test_d_persist_snapshot(active):
+        folder = active["test_d_evidence_dir"]
+        temporary = folder / "summary.pending"
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump({"test_d": active["test_d"]}, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, folder / "summary.json")
+
+    @staticmethod
+    def _test_d_path(active):
+        events = active.get("network_events", [])
+        created = [event for event in events if event.get("event_type") == "CREATE_OBJECT_URL"]
+        created_ids = {(event.get("frame_id"), event.get("blob_id")) for event in created}
+        def matches(event_type):
+            return any(event.get("event_type") == event_type
+                       and (event.get("frame_id"), event.get("blob_id")) in created_ids
+                       for event in events)
+        if created and any(event.get("frame_id") != active.get("test_d_main_frame_id") for event in created):
+            return "PATH D"
+        if matches("ANCHOR_CLICK"):
+            return "PATH A"
+        if matches("CAPTURE_CLICK_EVENT"):
+            return "PATH B"
+        if matches("WINDOW_OPEN_BLOB"):
+            return "PATH C"
+        return "PATH E" if not created else "PATH F"
+
+    @staticmethod
     def _classify_test_d(metadata, transfer, observation, active):
+        if not active.get("test_d_hook_verified", True):
+            return "TEST D INCONCLUSIVE: Blob interception hook was not installed/verified."
+        path = ATSApp._test_d_path(active)
+        frame_unobserved = (
+            any(not frame.get("instrumented") and frame.get("origin") == ONEBSS_URL.rstrip("/")
+                for frame in active.get("test_d_frame_inventory", []))
+            or any(event.get("reason_code") in ("ATTACHED_AFTER_SNAPSHOT", "NAVIGATED_AFTER_SNAPSHOT")
+                   for event in active.get("network_events", []))
+        )
         if active.get("download_event_seen"):
-            return "TEST D FAIL: Chrome Download Manager was not bypassed."
+            reasons = [event.get("reason_code") for event in active.get("network_events", [])
+                       if event.get("event_type") == "CANDIDATE EVALUATED"
+                       and event.get("candidate_decision") == "ALLOW"]
+            if path == "PATH E":
+                if frame_unobserved:
+                    return "TEST D INCONCLUSIVE: Required frame could not be instrumented."
+                return "TEST D INCONCLUSIVE: Export path was not observable by installed hooks."
+            suffix = f" {path}; reason={reasons[-1] if reasons else 'UNKNOWN'}."
+            return "TEST D FAIL: Native download occurred despite verified interception." + suffix
         if (
             active.get("close_reason") == "unexpected-browser-exit"
             or active.get("page_crashed") or active.get("page_closed")
             or active.get("context_closed") or active.get("browser_disconnected")
         ):
+            if path == "PATH E":
+                return ("TEST D INCONCLUSIVE: Required frame could not be instrumented."
+                        if frame_unobserved else
+                        "TEST D INCONCLUSIVE: Export path was not observable by installed hooks.")
             return "TEST D FAIL: Chrome or its page/context exited unexpectedly."
         if transfer.get("state") in ("corrupt", "transfer-failed"):
             return "TEST D FAIL: Captured XLSX is corrupt or chunk transfer failed."
@@ -2968,24 +3195,126 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
     def _run_export_test_d(self, page, context):
         """Capture one high-confidence XLSX Blob before Chrome receives a download."""
         active = self._active_export_diagnostic
+        evidence = APP_DATA / DIAGNOSTICS_DIRNAME / (
+            f"export_{time.strftime('%Y%m%d_%H%M%S')}_{active['id']}"
+        )
+        evidence.mkdir(parents=True, exist_ok=True)
+        active["test_d_evidence_dir"] = evidence
         active["network_armed"] = True
         active["test_d_active"] = True
-        metadata = {"state": "not-installed", "filename": "", "mime_type": "",
+        active["test_d_hook_verified"] = False
+        metadata = {"state": "not-installed", "filename_extension": "", "mime_category": "empty",
                     "blob_size": 0, "suppressed_count": 0, "multiple_candidates": False}
         transfer = {"state": "not-started", "bytes_transferred": 0}
         observation = ""
         clicked = False
         observation_started = False
         try:
-            if urlsplit(page.url).hostname != "onebss.vnpt.vn":
-                metadata["state"] = "wrong-origin"
-            elif not page.evaluate(TEST_D_HOOK_SCRIPT):
-                metadata["state"] = "installation-failed"
-            elif not page.evaluate("() => window.__atsTxlTestD.arm()"):
-                metadata["state"] = "arm-failed"
-            elif not page.evaluate("() => window.__atsTxlTestD.markExportClick()"):
-                metadata["state"] = "arm-failed"
-            else:
+            self._record_network_event(context, event_type="INSTALL REQUESTED", decision="observed")
+            context.expose_binding(
+                "__atsTxlTestDEvent",
+                lambda source, payload: self._test_d_js_event(context, source, payload),
+            )
+            frames, inventory = self._test_d_inventory_frames(page, context, active)
+            active["test_d_frame_inventory"] = inventory
+            main_frame = page.main_frame
+            main_id = active["test_d_frame_ids"].get(id(main_frame), "")
+            active["test_d_main_frame_id"] = main_id
+            try:
+                owner_count = page.get_by_text("Xuất Excel", exact=True).count()
+            except Exception:
+                owner_count = 0
+            active["test_d_button_owner"] = (
+                {"frame_id": main_id, "locator_count": owner_count}
+                if owner_count else {"frame_id": "unresolved", "locator_count": 0}
+            )
+            for frame, item in zip(frames, inventory):
+                frame_id = item["frame_id"]
+                if item["origin"] != ONEBSS_URL.rstrip("/") or not item["attached"]:
+                    item["not_instrumented_reason"] = (
+                        "CROSS_ORIGIN_OR_OPAQUE" if item["origin"] != ONEBSS_URL.rstrip("/")
+                        else "DETACHED"
+                    )
+                    self._record_network_event(context, event_type="FRAME NOT INSTRUMENTED",
+                                               frame_id=frame_id,
+                                               reason_code=item["not_instrumented_reason"],
+                                               decision="observed")
+                    continue
+                try:
+                    if not frame.evaluate(TEST_D_HOOK_SCRIPT,
+                                          {"frameId": frame_id, "observeOnly": frame is not main_frame}):
+                        raise RuntimeError("hook-install-returned-false")
+                    item["instrumented"] = True
+                    self._record_network_event(context, event_type="HOOK INSTALLED",
+                                               frame_id=frame_id, decision="observed")
+                    check = frame.evaluate("() => window.__atsTxlTestD.verify()")
+                    if not self._test_d_hook_verified(check, frame_id, False,
+                                                       frame is not main_frame):
+                        raise RuntimeError("hook-verification-failed")
+                    self._record_network_event(context, event_type="HOOK VERIFIED",
+                                               frame_id=frame_id, decision="observed")
+                    if not frame.evaluate("() => window.__atsTxlTestD.arm()"):
+                        raise RuntimeError("hook-arm-failed")
+                    check = frame.evaluate("() => window.__atsTxlTestD.verify()")
+                    if not self._test_d_hook_verified(check, frame_id, True,
+                                                       frame is not main_frame):
+                        raise RuntimeError("armed-verification-failed")
+                    item["document_id"] = check["document_id"]
+                    self._record_network_event(context, event_type="TEST D ARMED",
+                                               frame_id=frame_id, decision="observed")
+                except Exception as exc:
+                    item["instrumented"] = False
+                    item["not_instrumented_reason"] = type(exc).__name__
+                    self._record_network_event(context, event_type="FRAME NOT INSTRUMENTED",
+                                               frame_id=frame_id, reason_code=type(exc).__name__,
+                                               decision="observed")
+            main_item = next((item for item in inventory if item["main_frame"]), {})
+            active["test_d_hook_verified"] = bool(
+                main_item.get("instrumented") and main_item.get("document_id")
+                and all(item.get("instrumented") for item in inventory
+                        if item.get("origin") == ONEBSS_URL.rstrip("/"))
+            )
+            if active["test_d_hook_verified"]:
+                metadata = main_frame.evaluate("() => window.__atsTxlTestD.metadata()")
+                if metadata.get("state") != "armed":
+                    active["test_d_hook_verified"] = False
+            if active["test_d_hook_verified"]:
+                for frame, item in zip(frames, inventory):
+                    if item.get("instrumented"):
+                        if not frame.evaluate("() => window.__atsTxlTestD.markExportClick()"):
+                            active["test_d_hook_verified"] = False
+                            break
+                if active["test_d_hook_verified"]:
+                    # A final main-document handshake catches navigation/replacement
+                    # between installation and the click.
+                    check = main_frame.evaluate("() => window.__atsTxlTestD.verify()")
+                    active["test_d_hook_verified"] = self._test_d_hook_verified(check, main_id, True)
+            active["test_d"] = {
+                "pre_click_snapshot": {
+                    "hook_verified": active["test_d_hook_verified"],
+                    "main_frame_id": main_id,
+                    "document_id": main_item.get("document_id", ""),
+                    "armed": metadata.get("state") == "armed",
+                    "frame_inventory": inventory,
+                    "button_owner": active["test_d_button_owner"],
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+            }
+            self._test_d_persist_snapshot(active)
+            self._record_network_event(context, event_type="PRE-CLICK SNAPSHOT PERSISTED",
+                                       frame_id=main_id, decision="observed")
+            if active["test_d_hook_verified"]:
+                page.on("frameattached", lambda frame: self._record_network_event(
+                    context, event_type="FRAME NOT INSTRUMENTED",
+                    frame_id="dynamic", reason_code="ATTACHED_AFTER_SNAPSHOT", decision="observed",
+                ))
+                page.on("framenavigated", lambda frame: self._record_network_event(
+                    context, event_type="FRAME NOT INSTRUMENTED",
+                    frame_id=active["test_d_frame_ids"].get(id(frame), "dynamic"),
+                    reason_code="NAVIGATED_AFTER_SNAPSHOT", decision="observed",
+                ))
+                self._record_network_event(context, event_type="CLICK EXPORT", frame_id=main_id,
+                                           decision="observed")
                 self.write_log("Bấm Xuất Excel... (Test D: chặn Blob trước Chrome Download Manager)")
                 clicked = True
                 try:
@@ -2999,7 +3328,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 while time.monotonic() < deadline:
                     if active.get("download_event_seen") or page.is_closed() or active.get("browser_disconnected"):
                         break
-                    metadata = page.evaluate("() => window.__atsTxlTestD.metadata()")
+                    metadata = main_frame.evaluate("() => window.__atsTxlTestD.metadata()")
                     if metadata["state"] == "captured":
                         break
                     page.wait_for_timeout(100)
@@ -3013,7 +3342,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 observation = self._observe_test_c(page, context, active, duration_seconds=30)
                 if not page.is_closed():
                     try:
-                        metadata = page.evaluate("() => window.__atsTxlTestD.metadata()")
+                        metadata = main_frame.evaluate("() => window.__atsTxlTestD.metadata()")
                     except Exception:
                         pass
         except Exception as exc:
@@ -3026,9 +3355,8 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                     observation = self._observe_test_c(page, context, active, duration_seconds=30)
                 except Exception:
                     observation = "TEST C RESULT: INCONCLUSIVE; process observation failed."
-            else:
-                if not clicked:
-                    metadata["state"] = "instrumentation-failed"
+            elif not clicked:
+                metadata["state"] = "instrumentation-failed"
         finally:
             try:
                 if page.is_closed():
@@ -3036,8 +3364,11 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             except Exception:
                 pass
             active["test_d"] = {
+                **active.get("test_d", {}),
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 **metadata,
+                "hook_verified": active.get("test_d_hook_verified", False),
+                "export_path": self._test_d_path(active) if clicked else "not-clicked",
                 "chunk_size": TEST_D_CHUNK_BYTES,
                 "bytes_transferred": transfer.get("bytes_transferred", 0),
                 "validation": transfer.get("state", "not-started"),

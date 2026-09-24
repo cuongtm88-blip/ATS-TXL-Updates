@@ -691,6 +691,18 @@ class TestDBlobTests(unittest.TestCase):
         self.addCleanup(context.close)
         return page
 
+    def _diagnostic_state(self, page):
+        state = app.ATSApp.__new__(app.ATSApp)
+        state._active_export_diagnostic = {
+            "id": "test-d", "context": page.context, "events": [], "network_events": [],
+            "page_ids": {}, "main_browser_process": {"pid": 1},
+        }
+        state._diagnostic_page_ids = set()
+        state.write_log = Mock()
+        state._finish_export_diagnostic = Mock()
+        state._attach_page_diagnostics(page.context, page)
+        return state
+
     @staticmethod
     def _click_blob(page, mime, filename, mode="programmatic"):
         return page.evaluate("""([mime, filename, mode]) => {
@@ -833,9 +845,18 @@ class TestDBlobTests(unittest.TestCase):
         alive = "TEST C RESULT: Chrome remained alive for 30 seconds after Blob download."
         classify = app.ATSApp._classify_test_d
         self.assertIn("PASS", classify(meta, transfer, alive, {}))
-        self.assertIn("FAIL", classify(meta, transfer, alive, {"download_event_seen": True}))
-        self.assertIn("FAIL", classify(meta, transfer, alive,
-                                      {"close_reason": "unexpected-browser-exit"}))
+        self.assertIn("INCONCLUSIVE", classify(meta, transfer, alive, {"download_event_seen": True}))
+        self.assertIn("FAIL", classify(meta, transfer, alive, {
+            "download_event_seen": True, "test_d_main_frame_id": "frame-1",
+            "network_events": [{"event_type": "CREATE_OBJECT_URL", "frame_id": "frame-1"},
+                               {"event_type": "ANCHOR_CLICK", "frame_id": "frame-1"}],
+        }))
+        self.assertIn("INCONCLUSIVE", classify(meta, transfer, alive,
+                                              {"close_reason": "unexpected-browser-exit"}))
+        self.assertIn("FAIL", classify(meta, transfer, alive, {
+            "close_reason": "unexpected-browser-exit",
+            "network_events": [{"event_type": "CREATE_OBJECT_URL", "frame_id": "frame-1"}],
+        }))
         self.assertIn("FAIL", classify(meta, {"state": "corrupt"}, alive, {}))
         self.assertIn("INCONCLUSIVE", classify({"state": "armed"}, transfer, alive, {}))
         self.assertIn("INCONCLUSIVE", classify(meta, {"state": "size-limit"}, alive, {}))
@@ -889,7 +910,7 @@ class TestDBlobTests(unittest.TestCase):
             document.body.append(button);
         }""", base64.b64encode(source.getvalue()).decode("ascii"))
         state = app.ATSApp.__new__(app.ATSApp)
-        active = {"context": context, "events": [], "network_events": [],
+        active = {"id": "synthetic", "context": context, "events": [], "network_events": [],
                   "page_ids": {}, "main_browser_process": {"pid": 1}}
         state._active_export_diagnostic = active
         state._diagnostic_page_ids = set()
@@ -909,7 +930,9 @@ class TestDBlobTests(unittest.TestCase):
             return "TEST C RESULT: Chrome remained alive for 30 seconds after Blob download."
         with tempfile.TemporaryDirectory() as temporary, patch.object(
             app, "DOWNLOADS", Path(temporary)
-        ), patch.object(app.ATSApp, "_observe_test_c", side_effect=observe):
+        ), patch.object(app, "APP_DATA", Path(temporary)), patch.object(
+            app.ATSApp, "_observe_test_c", side_effect=observe
+        ):
             with self.assertRaises(app.DiagnosticTestCompleted) as completed:
                 state._run_export_test_d(page, context)
             self.assertEqual(len(list(Path(temporary).glob("*.xlsx"))), 1)
@@ -921,8 +944,13 @@ class TestDBlobTests(unittest.TestCase):
         context = Mock()
         page = Mock(url="https://onebss.vnpt.vn/test-d")
         page.is_closed.return_value = False
+        frame = Mock(url=page.url, parent_frame=None)
+        frame.is_detached.return_value = False
+        page.main_frame = frame
+        page.frames = [frame]
+        page.get_by_text.return_value.count.return_value = 1
         sequence = []
-        active = {"context": context, "events": [], "network_events": [],
+        active = {"id": "cleanup", "context": context, "events": [], "network_events": [],
                   "download_event_seen": False, "close_reason": "application-cleanup"}
         state = app.ATSApp.__new__(app.ATSApp)
         state._active_export_diagnostic = active
@@ -930,12 +958,29 @@ class TestDBlobTests(unittest.TestCase):
         state._finish_export_diagnostic = Mock()
         captured = {"state": "captured", "filename": "export.xlsx", "mime_type": "",
                     "blob_size": 123, "suppressed_count": 1, "multiple_candidates": False}
-        def evaluate(script):
-            if script == app.TEST_D_HOOK_SCRIPT or ".arm()" in script or ".markExportClick()" in script:
+        hook_state = {"armed": False, "clicked": False}
+        page.get_by_text.return_value.click.side_effect = lambda **kwargs: hook_state.update(clicked=True)
+        def evaluate(script, *args):
+            if script == "() => location.origin":
+                return "https://onebss.vnpt.vn"
+            if script == app.TEST_D_HOOK_SCRIPT:
                 return True
+            if ".arm()" in script:
+                hook_state["armed"] = True
+                return True
+            if ".markExportClick()" in script:
+                return True
+            if ".verify()" in script:
+                return {"version": app.TEST_D_HOOK_VERSION, "frame_id": "frame-1",
+                        "document_id": "document-mock", "origin": "https://onebss.vnpt.vn",
+                        "observe_only": False,
+                        "create_wrapped": True, "click_wrapped": True,
+                        "listener_installed": True, "blob_map_exists": True,
+                        "armed": hook_state["armed"]}
             if ".metadata()" in script:
-                return captured
+                return captured if hook_state["clicked"] else {**captured, "state": "armed"}
             return None
+        frame.evaluate.side_effect = evaluate
         page.evaluate.side_effect = evaluate
         with patch.object(app.ATSApp, "_transfer_test_d_blob", return_value={
             "state": "saved", "bytes_transferred": 123,
@@ -943,12 +988,195 @@ class TestDBlobTests(unittest.TestCase):
         }), patch.object(app.ATSApp, "_observe_test_c", side_effect=lambda *args, **kwargs: (
             sequence.append("observe") or
             "TEST C RESULT: Chrome remained alive for 30 seconds after Blob download."
-        )), self.assertRaises(app.DiagnosticTestCompleted):
+        )), tempfile.TemporaryDirectory() as temporary, patch.object(
+            app, "APP_DATA", Path(temporary)
+        ), self.assertRaises(app.DiagnosticTestCompleted):
             context.close.side_effect = lambda: sequence.append("context.close")
             state._run_export_test_d(page, context)
         self.assertLess(sequence.index("observe"), sequence.index("DIAGNOSTIC CLEANUP STARTED"))
         self.assertLess(sequence.index("DIAGNOSTIC CLEANUP STARTED"), sequence.index("context.close"))
         self.assertEqual(active["test_d"]["validation"], "saved")
+
+    def test_test_d_handshake_pass_and_fail_gate_export_click(self):
+        for verified in (True, False):
+            with self.subTest(verified=verified), tempfile.TemporaryDirectory() as temporary:
+                page = self._page(install=False)
+                page.evaluate("""() => {
+                    const button = document.createElement('button');
+                    button.textContent = 'Xuất Excel';
+                    button.onclick = () => {
+                        console.log('test-d-button-clicked');
+                        const a = document.createElement('a');
+                        a.href = URL.createObjectURL(new Blob(['test'], {type: 'application/pdf'}));
+                        a.download = 'other.pdf';
+                        a.click();
+                    };
+                    document.body.append(button);
+                }""")
+                clicked = []
+                page.on("console", lambda message: clicked.append(message.text)
+                        if message.text == "test-d-button-clicked" else None)
+                state = self._diagnostic_state(page)
+                with patch.object(app, "APP_DATA", Path(temporary)), patch.object(
+                    app, "TEST_D_HOOK_VERSION", app.TEST_D_HOOK_VERSION if verified else "wrong-version"
+                ), patch.object(app.ATSApp, "_observe_test_c", return_value="observation-finished"):
+                    with self.assertRaises(app.DiagnosticTestCompleted):
+                        state._run_export_test_d(page, page.context)
+                active = state._active_export_diagnostic
+                snapshot = active["test_d"]["pre_click_snapshot"]
+                self.assertEqual(snapshot["hook_verified"], verified)
+                self.assertEqual(bool(clicked), verified)
+                folder = active["test_d_evidence_dir"]
+                self.assertTrue((folder / "summary.json").exists())
+                self.assertIn("pre_click_snapshot", (folder / "summary.json").read_text())
+                if not verified:
+                    self.assertIn("INCONCLUSIVE", str(state.write_log.call_args_list))
+
+    def test_test_d_reason_codes_and_trigger_events(self):
+        page = self._page(install=False)
+        received = []
+        page.context.expose_binding("__atsTxlTestDEvent", lambda source, event: received.append(event))
+        self.assertTrue(page.evaluate(app.TEST_D_HOOK_SCRIPT, {"frameId": "frame-1"}))
+        self.assertTrue(page.evaluate("() => window.__atsTxlTestD.arm()"))
+        self.assertTrue(page.evaluate("() => window.__atsTxlTestD.markExportClick()"))
+        self._click_blob(page, "application/pdf", "misnamed.xlsx")
+        self._click_blob(page, "application/octet-stream", "other.pdf")
+        self._click_blob(page, "", "valid.xlsx")
+        page.evaluate("""() => document.querySelectorAll('a')[2].dispatchEvent(
+            new MouseEvent('click', {bubbles: true, cancelable: true}))""")
+        page.evaluate("() => URL.revokeObjectURL(document.querySelectorAll('a')[2].href)")
+        page.wait_for_timeout(200)
+        types = [event["event_type"] for event in received]
+        self.assertIn("CREATE_OBJECT_URL", types)
+        self.assertIn("ANCHOR_CLICK", types)
+        self.assertIn("CAPTURE_CLICK_EVENT", types)
+        self.assertIn("REVOKE_OBJECT_URL", types)
+        decisions = [event for event in received if event["event_type"] == "CANDIDATE EVALUATED"]
+        self.assertIn("MIME_REJECTED", [event["reason_code"] for event in decisions])
+        self.assertIn("FILENAME_NOT_XLSX", [event["reason_code"] for event in decisions])
+        self.assertTrue(any(event["decision"] == "SUPPRESS" for event in decisions))
+        self.assertTrue(any(event["decision"] == "SUPPRESS" and
+                            event["mime_category"] == "empty" for event in decisions))
+        self.assertFalse(any("url" in event or "filename" in event for event in received))
+
+    def test_test_d_frame_inventory_and_secondary_observation(self):
+        page = self._page(install=False)
+        page.evaluate("""() => {
+            const frame = document.createElement('iframe');
+            frame.src = '/test-d-frame?access_token=never-log-this';
+            document.body.append(frame);
+        }""")
+        page.frame_locator("iframe").locator("body").wait_for()
+        state = self._diagnostic_state(page)
+        active = state._active_export_diagnostic
+        active["network_armed"] = True
+        active["test_d_active"] = True
+        with tempfile.TemporaryDirectory() as temporary:
+            active["test_d_evidence_dir"] = Path(temporary)
+            page.context.expose_binding(
+                "__atsTxlTestDEvent",
+                lambda source, event: state._test_d_js_event(page.context, source, event),
+            )
+            frames, inventory = state._test_d_inventory_frames(page, page.context, active)
+            self.assertEqual(len(frames), 2)
+            self.assertEqual(inventory[1]["parent_frame_id"], inventory[0]["frame_id"])
+            self.assertFalse(inventory[1]["main_frame"])
+            self.assertNotIn("never-log-this", str(inventory))
+            self.assertTrue(frames[1].evaluate(app.TEST_D_HOOK_SCRIPT, {
+                "frameId": inventory[1]["frame_id"], "observeOnly": True,
+            }))
+            frames[1].evaluate("() => window.__atsTxlTestD.arm()")
+            frames[1].evaluate("() => window.__atsTxlTestD.markExportClick()")
+            frames[1].evaluate("""() => {
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(new Blob(['test'], {type: 'application/octet-stream'}));
+                a.download = 'test.xlsx';
+                a.click();
+            }""")
+            page.wait_for_timeout(150)
+            events = active["network_events"]
+            self.assertTrue(any(event["event_type"] == "CREATE_OBJECT_URL"
+                                and event["frame_id"] == inventory[1]["frame_id"] for event in events))
+            self.assertTrue(any(event.get("reason_code") == "OBSERVE_ONLY_FRAME" for event in events))
+            self.assertTrue((Path(temporary) / "export-network-events.jsonl").exists())
+
+    def test_test_d_binding_rejects_sensitive_page_payload(self):
+        state = app.ATSApp.__new__(app.ATSApp)
+        context = Mock()
+        frame = Mock()
+        state._active_export_diagnostic = {
+            "context": context, "network_armed": True, "network_events": [],
+            "test_d_frame_ids": {id(frame): "frame-1"},
+            "test_d_frame_inventory": [{"frame_id": "frame-1", "document_id": "document-safe"}],
+        }
+        state._test_d_js_event(context, {"frame": frame}, {
+            "event_type": "CANDIDATE EVALUATED", "reason_code": "Bearer secret",
+            "filename_extension": ".token-secret", "document_id": "access_token=secret",
+            "url": "https://onebss.vnpt.vn/?Cookie=secret", "blob_content": "password=secret",
+            "decision": "ALLOW", "blob_size": 12,
+        })
+        encoded = json.dumps(state._active_export_diagnostic["network_events"])
+        self.assertNotIn("secret", encoded)
+        self.assertIn("document-safe", encoded)
+
+    def test_test_d_immediate_download_preserves_preclick_snapshot_and_events(self):
+        page = self._page(install=False)
+        page.evaluate("""() => {
+            const button = document.createElement('button');
+            button.textContent = 'Xuất Excel';
+            button.onclick = () => {
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(new Blob(['test'], {type: 'application/pdf'}));
+                a.download = 'other.pdf';
+                a.click();
+            };
+            document.body.append(button);
+        }""")
+        state = self._diagnostic_state(page)
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            app, "APP_DATA", Path(temporary)
+        ), patch.object(app.ATSApp, "_observe_test_c", return_value="observation-finished"):
+            with self.assertRaises(app.DiagnosticTestCompleted):
+                state._run_export_test_d(page, page.context)
+            active = state._active_export_diagnostic
+            self.assertTrue(active["download_event_seen"])
+            self.assertTrue(active["test_d"]["pre_click_snapshot"]["hook_verified"])
+            self.assertNotEqual(active["test_d"]["state"], "not-installed")
+            events = (active["test_d_evidence_dir"] / "export-network-events.jsonl").read_text()
+            self.assertIn("PRE-CLICK SNAPSHOT PERSISTED", events)
+            self.assertIn("TEST D DOWNLOAD EVENT DETECTED", events)
+            self.assertIn("CREATE_OBJECT_URL", events)
+            self.assertIn("FILENAME_NOT_XLSX", events)
+
+    def test_test_d_immediate_page_close_preserves_preclick_snapshot(self):
+        page = self._page(install=False)
+        page.evaluate("""() => {
+            const button = document.createElement('button');
+            button.textContent = 'Xuất Excel';
+            document.body.append(button);
+        }""")
+        state = self._diagnostic_state(page)
+        real_locator = page.get_by_text("Xuất Excel", exact=True)
+        locator = Mock()
+        locator.count.return_value = 1
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            app, "APP_DATA", Path(temporary)
+        ), patch.object(app.ATSApp, "_observe_test_c", return_value="observation-finished"), patch.object(
+            page, "get_by_text", return_value=locator
+        ):
+            def close_after_click(**kwargs):
+                folder = state._active_export_diagnostic["test_d_evidence_dir"]
+                self.assertTrue((folder / "summary.json").exists())
+                real_locator.click(**kwargs)
+                page.close()
+            locator.click.side_effect = close_after_click
+            with self.assertRaises(app.DiagnosticTestCompleted):
+                state._run_export_test_d(page, page.context)
+            active = state._active_export_diagnostic
+            self.assertTrue(active["test_d"]["pre_click_snapshot"]["hook_verified"])
+            self.assertTrue(active["page_closed"])
+            self.assertIn("PRE-CLICK SNAPSHOT PERSISTED",
+                          (active["test_d_evidence_dir"] / "export-network-events.jsonl").read_text())
 
 
 if __name__ == "__main__":
