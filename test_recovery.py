@@ -16,10 +16,10 @@ import diagnostics_upload
 import updater
 
 
-def fake_onebss_grid_snapshot(total_count=2):
+def fake_onebss_grid_snapshot(total_count=2, row_count=2, page_size=10):
     headers = [mapping[0] for mapping in app.ONEBSS_UI_COLUMN_MAPPING]
     rows = []
-    for number in range(1, 3):
+    for number in range(1, row_count + 1):
         row = {header: f"FAKE-{header}-{number}" for header in headers}
         row["Mã báo hỏng"] = f"FAKE-ID-{number}"
         row["Số ảo"] = f"FAKE-VIRTUAL-{number}"
@@ -27,7 +27,7 @@ def fake_onebss_grid_snapshot(total_count=2):
     return {
         "total_count": total_count,
         "detected_headers": headers,
-        "current_page_size": 10,
+        "current_page_size": page_size,
         "current_page": 1,
         "rows": rows,
     }
@@ -44,6 +44,46 @@ def fake_onebss_grid_rows(start, count):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_page_size_timeout_metadata_preserves_initial_grid_snapshot(self):
+        snapshot = fake_onebss_grid_snapshot(total_count=57, row_count=10)
+        page = Mock()
+
+        def evaluate(script, *args):
+            if script == app.ONEBSS_GRID_READ_SCRIPT:
+                return snapshot
+            if script == app.ONEBSS_PAGE_SIZE_STATE_SCRIPT:
+                return {
+                    "page_size_control_found": True,
+                    "initial_page_size_detected": 10,
+                    "footer": "Tổng cộng 57 bản ghi. Đang hiển thị bản ghi số 1 đến 10.",
+                    "dropdown_opened": False,
+                    "options": [],
+                }
+            if script == app.ONEBSS_GRID_MUTATION_OBSERVER_SCRIPT:
+                return False
+            self.fail("Unexpected page.evaluate script")
+
+        page.evaluate.side_effect = evaluate
+        dropdown = Mock()
+        dropdown.wait_for.side_effect = TimeoutError("simulated locator timeout")
+        locator = Mock()
+        locator.first = dropdown
+        page.locator.return_value = locator
+        state = app.ATSApp.__new__(app.ATSApp)
+
+        with self.assertRaises(app.OneBSSGridReadError) as raised:
+            state._read_onebss_grid(page, 57)
+
+        metadata = raised.exception.metadata
+        self.assertEqual(metadata["timeout_stage"], "wait-page-size-control-visible")
+        self.assertEqual(metadata["initial_page_size"], 10)
+        self.assertEqual(metadata["initial_page_size_detected"], 10)
+        self.assertEqual(metadata["selected_page_size"], 100)
+        self.assertEqual(metadata["row_count"], 10)
+        self.assertEqual(len(metadata["detected_headers"]), 25)
+        self.assertEqual(metadata["unique_ma_bh_count"], 10)
+        self.assertNotIn("FAKE-ID-1", json.dumps(metadata, ensure_ascii=False))
+
     def test_onebss_grid_collects_all_required_total_sizes(self):
         cases = (
             (0, 10, 0), (1, 10, 1), (10, 10, 1), (11, 20, 1),

@@ -252,6 +252,68 @@ def _collect_onebss_grid_pages(
     return aggregate
 
 
+def _onebss_grid_failure_metadata(total_count, snapshot, progress, error):
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    headers = snapshot.get("detected_headers")
+    headers = headers if isinstance(headers, list) else []
+    rows = snapshot.get("rows")
+    rows = rows if isinstance(rows, list) else []
+    header_to_source = {}
+    duplicate_headers = []
+    for raw_header in headers:
+        canonical = ONEBSS_HEADER_ALIASES.get(_normalize_onebss_header(raw_header))
+        if canonical is None:
+            continue
+        if canonical in header_to_source:
+            duplicate_headers.append(canonical)
+        else:
+            header_to_source[canonical] = raw_header
+    expected_headers = [item[0] for item in ONEBSS_UI_COLUMN_MAPPING]
+    missing_headers = [header for header in expected_headers if header not in header_to_source]
+    key_header = header_to_source.get("Mã báo hỏng")
+    keys = []
+    missing_ma_bh_count = 0
+    missing_cell_count = 0
+    for row in rows:
+        row = row if isinstance(row, dict) else {}
+        missing_cell_count += sum(
+            header not in header_to_source or header_to_source[header] not in row
+            for header in expected_headers
+        )
+        value = row.get(key_header) if key_header else None
+        key = unicodedata.normalize("NFC", str(value)).strip() if value is not None else ""
+        if key:
+            keys.append(key)
+        else:
+            missing_ma_bh_count += 1
+    unique_count = len(set(keys))
+    duplicate_count = len(keys) - unique_count
+    metadata = {
+        "total_count": total_count,
+        "initial_page_size": progress.get("initial_page_size_detected"),
+        "selected_page_size": progress.get("target_page_size"),
+        "pages_read": 0,
+        "row_count": len(rows),
+        "unique_ma_bh_count": unique_count,
+        "duplicate_ma_bh_count": duplicate_count,
+        "missing_ma_bh_count": missing_ma_bh_count,
+        "missing_cell_count": missing_cell_count,
+        "detected_headers": [str(value)[:120] for value in headers if isinstance(value, str)][:80],
+        "missing_headers": missing_headers,
+        "duplicate_headers": sorted(set(duplicate_headers)),
+        "mapping_status": _onebss_mapping_status(),
+        "invariants": {},
+        "result": "FAIL",
+        "reader_error_type": type(error).__name__,
+        **progress,
+    }
+    metadata["failure_stage"] = progress.get("active_stage")
+    if type(error).__name__ == "TimeoutError" and not metadata.get("timeout_stage"):
+        metadata["timeout_stage"] = progress.get("active_stage")
+    metadata.pop("active_stage", None)
+    return metadata
+
+
 def _parse_onebss_grid_snapshot(snapshot):
     """Map a metadata-described grid snapshot without relying on column order."""
     snapshot = snapshot if isinstance(snapshot, dict) else {}
@@ -435,6 +497,71 @@ ONEBSS_GRID_READ_SCRIPT = r"""() => {
     });
     return {detected_headers: detectedHeaders, current_page_size: currentPageSize,
         current_page: currentPage, rows};
+}"""
+
+
+ONEBSS_PAGE_SIZE_STATE_SCRIPT = r"""(allowedSizes) => {
+    const norm = value => typeof value === 'string'
+        ? value.normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase() : '';
+    const roots = [...document.querySelectorAll('.e-grid, [role="grid"]')];
+    const root = roots.find(element => {
+        const headers = [...element.querySelectorAll('th,[role="columnheader"]')]
+            .map(node => norm(node.textContent));
+        return headers.some(value => value.includes(norm('Mã thuê bao'))) &&
+            headers.some(value => value.includes(norm('Mã báo hỏng')));
+    });
+    if (!root) return {page_size_control_found: false, initial_page_size_detected: null, footer: '', dropdown_opened: false, options: []};
+    const pager = root.querySelector('.e-pager, [class*="pager"]') ||
+        root.parentElement?.querySelector('.e-pager, [class*="pager"]') || null;
+    const controls = pager ? [...pager.querySelectorAll(
+        '.e-pagesizes input, .e-dropdownlist input, input[role="combobox"]'
+    )] : [];
+    const visible = element => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    const control = controls.find(visible) || null;
+    const instance = root.ej2_instances?.find(item => item.pageSettings && typeof item.getColumns === 'function');
+    const inputMatch = String(control?.value || '').match(/\d+/);
+    const initialPageSize = Number.isInteger(instance?.pageSettings?.pageSize)
+        ? instance.pageSettings.pageSize : inputMatch ? Number(inputMatch[0]) : null;
+    const footer = (pager?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    const popups = [...document.querySelectorAll('.e-popup')].filter(visible);
+    const optionTexts = popups.flatMap(popup => [...popup.querySelectorAll('*')]
+        .filter(element => visible(element) && !element.children.length)
+        .map(element => (element.innerText || element.textContent || '').trim()));
+    const options = [...new Set(optionTexts.map(text => /^\d+$/.test(text) ? Number(text) : null)
+        .filter(value => allowedSizes.includes(value)))].sort((a, b) => a - b);
+    return {
+        page_size_control_found: Boolean(control),
+        initial_page_size_detected: initialPageSize,
+        footer,
+        dropdown_opened: Boolean(control?.getAttribute('aria-expanded') === 'true' || popups.length),
+        options
+    };
+}"""
+
+
+ONEBSS_GRID_MUTATION_OBSERVER_SCRIPT = r"""(action) => {
+    if (action === 'start') {
+        const root = [...document.querySelectorAll('.e-grid, [role="grid"]')].find(element => {
+            const text = (element.innerText || '').toLowerCase();
+            return text.includes('mã thuê bao') && text.includes('mã báo hỏng');
+        });
+        if (!root) return false;
+        const target = root.querySelector('.e-gridcontent tbody') || root;
+        const state = {changed: false, observer: null};
+        state.observer = new MutationObserver(() => { state.changed = true; });
+        state.observer.observe(target, {childList: true, subtree: true, attributes: true});
+        window.__atsTxlGridPageSizeObserver = state;
+        return true;
+    }
+    const state = window.__atsTxlGridPageSizeObserver;
+    if (!state) return false;
+    state.observer.disconnect();
+    delete window.__atsTxlGridPageSizeObserver;
+    return Boolean(state.changed);
 }"""
 
 
@@ -3291,14 +3418,44 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
 
     def _read_onebss_grid(self, page, total_count):
         """Read all pages through the grid UI; row values remain in memory only."""
-        if not isinstance(total_count, int) or isinstance(total_count, bool) or total_count < 0:
-            raise ValueError("Search completion did not provide a valid total_count")
-        initial_snapshot = page.evaluate(ONEBSS_GRID_READ_SCRIPT)
+        progress = {
+            "page_size_control_found": None,
+            "initial_page_size_detected": None,
+            "dropdown_opened": False,
+            "available_page_size_options": [],
+            "target_page_size": None,
+            "target_option_found": False,
+            "target_option_clicked": False,
+            "footer_before": "",
+            "footer_after": "",
+            "grid_rerender_detected": False,
+            "timeout_stage": None,
+            "failure_stage": None,
+            "active_stage": "validate-total-count",
+        }
+        initial_snapshot = {}
+        latest_snapshot = {}
+        observer_started = False
+
+        def read_dom_state():
+            state = page.evaluate(ONEBSS_PAGE_SIZE_STATE_SCRIPT, list(ONEBSS_GRID_PAGE_SIZES))
+            progress["page_size_control_found"] = state.get("page_size_control_found")
+            if progress["initial_page_size_detected"] is None:
+                progress["initial_page_size_detected"] = state.get("initial_page_size_detected")
+            if state.get("options"):
+                progress["available_page_size_options"] = state["options"]
+            progress["dropdown_opened"] = progress["dropdown_opened"] or bool(state.get("dropdown_opened"))
+            progress["footer_after"] = state.get("footer", "")
+            return state
 
         def read_current_page():
-            return page.evaluate(ONEBSS_GRID_READ_SCRIPT)
+            nonlocal latest_snapshot
+            progress["active_stage"] = "read-grid-page"
+            latest_snapshot = page.evaluate(ONEBSS_GRID_READ_SCRIPT)
+            return latest_snapshot
 
         def wait_for_grid_state(page_number, page_size, expected_rows):
+            progress["active_stage"] = f"wait-grid-render-page-{page_number}"
             page.wait_for_function(
                 r"""({pageNumber, pageSize, expectedRows}) => {
                     const norm = value => (value || '').normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase();
@@ -3328,17 +3485,57 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             )
 
         def select_page_size(page_size):
+            nonlocal observer_started
+            progress["target_page_size"] = page_size
+            progress["active_stage"] = "inspect-page-size-control"
+            state = read_dom_state()
+            progress["footer_before"] = state.get("footer", "")
+            if progress["initial_page_size_detected"] is None:
+                progress["initial_page_size_detected"] = state.get("initial_page_size_detected")
             dropdown = page.locator(
-                ".e-pager .e-pagesizes input[role='combobox'], "
-                ".e-pager .e-dropdownlist input[role='combobox'], "
+                ".e-pager .e-pagesizes input, "
+                ".e-pager .e-dropdownlist input, "
                 ".e-pager input[role='combobox']"
             ).first
+            progress["active_stage"] = "wait-page-size-control-visible"
             dropdown.wait_for(state="visible", timeout=10000)
+            progress["page_size_control_found"] = True
+            progress["active_stage"] = "open-page-size-dropdown"
             dropdown.click(timeout=10000)
-            page.get_by_role("option", name=str(page_size), exact=True).click(timeout=10000)
+            progress["active_stage"] = "inspect-open-page-size-dropdown"
+            state = read_dom_state()
+            progress["dropdown_opened"] = bool(state.get("dropdown_opened"))
+            progress["available_page_size_options"] = state.get("options", [])
+            progress["target_option_found"] = page_size in progress["available_page_size_options"]
+            if not progress["dropdown_opened"] or not progress["target_option_found"]:
+                raise RuntimeError("EJ2 page-size dropdown did not expose the requested option")
+            progress["active_stage"] = "start-grid-rerender-observer"
+            observer_started = bool(page.evaluate(ONEBSS_GRID_MUTATION_OBSERVER_SCRIPT, "start"))
+            option = page.locator(".e-popup:visible").get_by_text(
+                str(page_size), exact=True
+            ).first
+            progress["active_stage"] = "wait-target-page-size-option-visible"
+            option.wait_for(state="visible", timeout=10000)
+            progress["target_option_found"] = True
+            progress["active_stage"] = "click-target-page-size-option"
+            option.click(timeout=10000)
+            progress["target_option_clicked"] = True
+            progress["active_stage"] = "wait-page-size-grid-render"
             wait_for_grid_state(1, page_size, min(page_size, total_count))
+            progress["active_stage"] = "capture-page-size-result"
+            state = read_dom_state()
+            progress["footer_after"] = state.get("footer", "")
+            if observer_started:
+                progress["grid_rerender_detected"] = bool(
+                    page.evaluate(ONEBSS_GRID_MUTATION_OBSERVER_SCRIPT, "stop")
+                )
+                observer_started = False
+            progress["grid_rerender_detected"] = progress["grid_rerender_detected"] or (
+                progress["footer_after"] != progress["footer_before"]
+            )
 
         def go_to_page(page_number):
+            progress["active_stage"] = f"navigate-to-page-{page_number}"
             next_button = page.locator(".e-pager .e-nextpage").first
             next_button.wait_for(state="visible", timeout=10000)
             next_button.click(timeout=10000)
@@ -3348,14 +3545,54 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             )
             wait_for_grid_state(page_number, _onebss_grid_page_size(total_count), expected_rows)
 
-        aggregate = _collect_onebss_grid_pages(
-            total_count,
-            initial_snapshot,
-            select_page_size,
-            read_current_page,
-            go_to_page,
-        )
-        return _parse_onebss_grid_snapshot(aggregate)
+        try:
+            if not isinstance(total_count, int) or isinstance(total_count, bool) or total_count < 0:
+                raise ValueError("Search completion did not provide a valid total_count")
+            progress["active_stage"] = "read-initial-grid-snapshot"
+            initial_snapshot = page.evaluate(ONEBSS_GRID_READ_SCRIPT)
+            latest_snapshot = initial_snapshot
+            progress["initial_page_size_detected"] = initial_snapshot.get("current_page_size")
+            progress["target_page_size"] = _onebss_grid_page_size(total_count)
+            initial_state = read_dom_state()
+            if progress["initial_page_size_detected"] is None:
+                progress["initial_page_size_detected"] = initial_state.get("initial_page_size_detected")
+            progress["footer_before"] = initial_state.get("footer", "")
+            aggregate = _collect_onebss_grid_pages(
+                total_count,
+                initial_snapshot,
+                select_page_size,
+                read_current_page,
+                go_to_page,
+            )
+            progress["active_stage"] = "validate-complete-grid"
+            result = _parse_onebss_grid_snapshot(aggregate)
+            result["metadata"].update({key: value for key, value in progress.items() if key != "active_stage"})
+            return result
+        except OneBSSGridReadError as exc:
+            exc.metadata.update({key: value for key, value in progress.items() if key != "active_stage"})
+            raise
+        except Exception as exc:
+            if type(exc).__name__ == "TimeoutError":
+                progress["timeout_stage"] = progress.get("active_stage")
+            try:
+                state = read_dom_state()
+                progress["footer_after"] = state.get("footer", "")
+            except Exception:
+                pass
+            if observer_started:
+                try:
+                    progress["grid_rerender_detected"] = bool(
+                        page.evaluate(ONEBSS_GRID_MUTATION_OBSERVER_SCRIPT, "stop")
+                    )
+                except Exception:
+                    pass
+            try:
+                latest_snapshot = page.evaluate(ONEBSS_GRID_READ_SCRIPT)
+            except Exception:
+                pass
+            raise OneBSSGridReadError(
+                _onebss_grid_failure_metadata(total_count, latest_snapshot or initial_snapshot, progress, exc)
+            ) from exc
 
     def _run_onebss_grid_diagnostic(self, page, total_count):
         """Run the data reader in isolation and persist only aggregate metadata."""
