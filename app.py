@@ -167,6 +167,91 @@ class OneBSSGridReadError(RuntimeError):
         super().__init__("OneBSS grid data failed validation")
 
 
+ONEBSS_GRID_PAGE_SIZES = (10, 20, 30, 50, 100, 200, 500, 1000, 2000)
+
+
+def _onebss_grid_page_size(total_count):
+    if not isinstance(total_count, int) or isinstance(total_count, bool) or total_count < 0:
+        raise ValueError("OneBSS total_count must be a non-negative integer")
+    return next(
+        (size for size in ONEBSS_GRID_PAGE_SIZES if total_count <= size),
+        ONEBSS_GRID_PAGE_SIZES[-1],
+    )
+
+
+def _onebss_grid_page_count(total_count, page_size):
+    if total_count == 0:
+        return 0
+    return (total_count + page_size - 1) // page_size
+
+
+def _parse_onebss_total_count(text):
+    if not isinstance(text, str):
+        return None
+    match = re.search(r"Tổng cộng\s*([\d.,\s\u00a0]+?)\s*bản ghi", text, re.IGNORECASE)
+    if not match:
+        return None
+    digits = re.sub(r"\D", "", match.group(1))
+    return int(digits) if digits else None
+
+
+def _collect_onebss_grid_pages(
+    total_count,
+    initial_snapshot,
+    select_page_size,
+    read_current_page,
+    go_to_page,
+):
+    """Collect every page in memory, returning no partial data on failure."""
+    selected_page_size = _onebss_grid_page_size(total_count)
+    initial_page_size = initial_snapshot.get("current_page_size")
+    first_page = initial_snapshot
+    if initial_page_size != selected_page_size:
+        select_page_size(selected_page_size)
+        first_page = read_current_page()
+    if first_page.get("current_page_size") != selected_page_size:
+        raise RuntimeError("OneBSS did not apply the selected page size")
+    if first_page.get("current_page") != 1:
+        raise RuntimeError("OneBSS grid did not return to its first page")
+
+    page_count = _onebss_grid_page_count(total_count, selected_page_size)
+    expected_first_page_rows = min(total_count, selected_page_size)
+    if len(first_page.get("rows", [])) != expected_first_page_rows:
+        raise RuntimeError("OneBSS first page row count did not match the selected page size")
+    pages = []
+    if page_count:
+        pages.append(first_page)
+        expected_headers = first_page.get("detected_headers")
+        for page_number in range(2, page_count + 1):
+            go_to_page(page_number)
+            snapshot = read_current_page()
+            if snapshot.get("current_page") != page_number:
+                raise RuntimeError("OneBSS grid pagination did not reach the requested page")
+            if snapshot.get("current_page_size") != selected_page_size:
+                raise RuntimeError("OneBSS grid page size changed during pagination")
+            if snapshot.get("detected_headers") != expected_headers:
+                raise RuntimeError("OneBSS grid headers changed during pagination")
+            expected_rows = min(
+                selected_page_size,
+                total_count - (page_number - 1) * selected_page_size,
+            )
+            if len(snapshot.get("rows", [])) != expected_rows:
+                raise RuntimeError("OneBSS page row count did not match the expected page size")
+            pages.append(snapshot)
+
+    headers = first_page.get("detected_headers", [])
+    records = [row for snapshot in pages for row in snapshot.get("rows", [])]
+    aggregate = {
+        "total_count": total_count,
+        "detected_headers": headers,
+        "rows": records,
+        "initial_page_size": initial_page_size,
+        "selected_page_size": selected_page_size,
+        "pages_read": len(pages),
+    }
+    return aggregate
+
+
 def _parse_onebss_grid_snapshot(snapshot):
     """Map a metadata-described grid snapshot without relying on column order."""
     snapshot = snapshot if isinstance(snapshot, dict) else {}
@@ -241,6 +326,9 @@ def _parse_onebss_grid_snapshot(snapshot):
     }
     metadata = {
         "total_count": total_count,
+        "initial_page_size": snapshot.get("initial_page_size"),
+        "selected_page_size": snapshot.get("selected_page_size"),
+        "pages_read": snapshot.get("pages_read", 1 if row_count else 0),
         "row_count": row_count,
         "unique_ma_bh_count": unique_ma_bh_count,
         "duplicate_ma_bh_count": duplicate_ma_bh_count,
@@ -303,10 +391,19 @@ ONEBSS_GRID_READ_SCRIPT = r"""() => {
             !row.matches('.e-filterbar, .e-emptyrow, .e-summaryrow, [aria-hidden="true"]'))}))
         .sort((a, b) => b.rows.length - a.rows.length)[0];
     const domRows = contentTable?.rows || [];
-    const pager = root.querySelector('.e-pager, [class*="pager"]');
-    const totalText = pager?.textContent || '';
-    const totalMatch = totalText.match(/Tổng cộng\s*(\d+)\s*bản ghi/i);
-    const totalCount = totalMatch ? Number(totalMatch[1]) : null;
+    const pager = root.querySelector('.e-pager, [class*="pager"]') ||
+        root.parentElement?.querySelector('.e-pager, [class*="pager"]') || null;
+    const pageSizeInput = pager?.querySelector(
+        '.e-pagesizes input[role="combobox"], .e-dropdownlist input[role="combobox"], input[role="combobox"], input'
+    ) || null;
+    const pageSettings = gridInstance?.pageSettings || null;
+    const sizeFromInput = String(pageSizeInput?.value || '').match(/\d+/);
+    const currentPageSize = Number.isInteger(pageSettings?.pageSize)
+        ? pageSettings.pageSize : sizeFromInput ? Number(sizeFromInput[0]) : null;
+    const currentPageNode = pager?.querySelector('.e-currentitem, [aria-current="page"]') || null;
+    const currentPage = Number.isInteger(pageSettings?.currentPage)
+        ? pageSettings.currentPage
+        : Number((currentPageNode?.textContent || '').trim()) || null;
     const rows = domRows.map(row => {
         let raw = null;
         if (gridInstance) {
@@ -336,7 +433,8 @@ ONEBSS_GRID_READ_SCRIPT = r"""() => {
         });
         return result;
     });
-    return {total_count: totalCount, detected_headers: detectedHeaders, rows};
+    return {detected_headers: detectedHeaders, current_page_size: currentPageSize,
+        current_page: currentPage, rows};
 }"""
 
 
@@ -3191,23 +3289,104 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             f"Tệp metadata: {report}"
         )
 
-    def _read_onebss_grid(self, page):
-        """Read and validate all grid rows; row values remain in memory only."""
-        snapshot = page.evaluate(ONEBSS_GRID_READ_SCRIPT)
-        return _parse_onebss_grid_snapshot(snapshot)
+    def _read_onebss_grid(self, page, total_count):
+        """Read all pages through the grid UI; row values remain in memory only."""
+        if not isinstance(total_count, int) or isinstance(total_count, bool) or total_count < 0:
+            raise ValueError("Search completion did not provide a valid total_count")
+        initial_snapshot = page.evaluate(ONEBSS_GRID_READ_SCRIPT)
 
-    def _run_onebss_grid_diagnostic(self, page):
+        def read_current_page():
+            return page.evaluate(ONEBSS_GRID_READ_SCRIPT)
+
+        def wait_for_grid_state(page_number, page_size, expected_rows):
+            page.wait_for_function(
+                r"""({pageNumber, pageSize, expectedRows}) => {
+                    const norm = value => (value || '').normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase();
+                    const root = [...document.querySelectorAll('.e-grid, [role="grid"]')].find(element => {
+                        const headers = [...element.querySelectorAll('th,[role="columnheader"]')].map(node => norm(node.textContent));
+                        return headers.some(value => value.includes(norm('Mã thuê bao'))) &&
+                            headers.some(value => value.includes(norm('Mã báo hỏng')));
+                    });
+                    if (!root) return false;
+                    const instance = root.ej2_instances?.find(item => item.pageSettings && typeof item.getColumns === 'function');
+                    const pager = root.querySelector('.e-pager, [class*="pager"]') || root.parentElement?.querySelector('.e-pager, [class*="pager"]');
+                    const pageSizeInput = pager?.querySelector('.e-pagesizes input[role="combobox"], .e-dropdownlist input[role="combobox"], input[role="combobox"], input');
+                    const inputSize = Number(String(pageSizeInput?.value || '').match(/\d+/)?.[0]);
+                    const actualSize = Number.isInteger(instance?.pageSettings?.pageSize) ? instance.pageSettings.pageSize : inputSize;
+                    const currentPageNode = pager?.querySelector('.e-currentitem, [aria-current="page"]');
+                    const actualPage = Number.isInteger(instance?.pageSettings?.currentPage)
+                        ? instance.pageSettings.currentPage : Number((currentPageNode?.textContent || '').trim());
+                    const rows = [...root.querySelectorAll('tbody tr')].filter(row =>
+                        row.querySelectorAll('td').length > 0 && row.closest('.e-grid') === root &&
+                        !row.matches('.e-filterbar, .e-emptyrow, .e-summaryrow, [aria-hidden="true"]'));
+                    const spinner = root.querySelector('.e-spinner-pane.e-spin-show');
+                    return actualPage === pageNumber && actualSize === pageSize &&
+                        rows.length === expectedRows && !spinner;
+                }""",
+                {"pageNumber": page_number, "pageSize": page_size, "expectedRows": expected_rows},
+                timeout=30000,
+            )
+
+        def select_page_size(page_size):
+            dropdown = page.locator(
+                ".e-pager .e-pagesizes input[role='combobox'], "
+                ".e-pager .e-dropdownlist input[role='combobox'], "
+                ".e-pager input[role='combobox']"
+            ).first
+            dropdown.wait_for(state="visible", timeout=10000)
+            dropdown.click(timeout=10000)
+            page.get_by_role("option", name=str(page_size), exact=True).click(timeout=10000)
+            wait_for_grid_state(1, page_size, min(page_size, total_count))
+
+        def go_to_page(page_number):
+            next_button = page.locator(".e-pager .e-nextpage").first
+            next_button.wait_for(state="visible", timeout=10000)
+            next_button.click(timeout=10000)
+            expected_rows = min(
+                _onebss_grid_page_size(total_count),
+                total_count - (page_number - 1) * _onebss_grid_page_size(total_count),
+            )
+            wait_for_grid_state(page_number, _onebss_grid_page_size(total_count), expected_rows)
+
+        aggregate = _collect_onebss_grid_pages(
+            total_count,
+            initial_snapshot,
+            select_page_size,
+            read_current_page,
+            go_to_page,
+        )
+        return _parse_onebss_grid_snapshot(aggregate)
+
+    def _run_onebss_grid_diagnostic(self, page, total_count):
         """Run the data reader in isolation and persist only aggregate metadata."""
         try:
-            result = self._read_onebss_grid(page)
+            result = self._read_onebss_grid(page, total_count)
             metadata = result["metadata"]
         except OneBSSGridReadError as exc:
             metadata = exc.metadata
         except Exception as exc:
+            selected_page_size = None
             try:
-                _parse_onebss_grid_snapshot({})
-            except OneBSSGridReadError as parse_exc:
-                metadata = parse_exc.metadata
+                selected_page_size = _onebss_grid_page_size(total_count)
+            except ValueError:
+                pass
+            metadata = {
+                "total_count": total_count,
+                "initial_page_size": None,
+                "selected_page_size": selected_page_size,
+                "pages_read": 0,
+                "row_count": 0,
+                "unique_ma_bh_count": 0,
+                "duplicate_ma_bh_count": 0,
+                "missing_ma_bh_count": 0,
+                "missing_cell_count": 0,
+                "detected_headers": [],
+                "missing_headers": [item[0] for item in ONEBSS_UI_COLUMN_MAPPING],
+                "duplicate_headers": [],
+                "mapping_status": _onebss_mapping_status(),
+                "invariants": {},
+                "result": "FAIL",
+            }
             metadata["reader_error_type"] = type(exc).__name__
 
         folder = APP_DATA / DIAGNOSTICS_DIRNAME / (
@@ -3300,9 +3479,9 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
         try:
             self.write_log("Bấm Tìm kiếm và chờ tải hết phiếu...")
             page.get_by_text("Tìm kiếm", exact=True).click(timeout=15000)
-            self._wait_for_search_complete(page)
+            total_count = self._wait_for_search_complete(page)
             if probe_only:
-                self._run_onebss_grid_diagnostic(page)
+                self._run_onebss_grid_diagnostic(page, total_count)
             self.write_log("Bấm Xuất Excel...")
             page.evaluate("""() => {
                 window.__atsTxlExportCapture = {armed: true, blobUrl: null};
@@ -4261,10 +4440,12 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 page.wait_for_timeout(1000)
                 totals = page.locator("text=/Tổng cộng.*bản ghi/").all_inner_texts()
                 if totals:
+                    total_count = _parse_onebss_total_count(totals[-1])
                     self.write_log(f"OneBSS đã tải xong: {totals[-1].strip()}")
                 else:
+                    total_count = None
                     self.write_log("OneBSS đã tải xong toàn bộ kết quả.")
-                return
+                return total_count
 
             if time.monotonic() >= next_progress_log:
                 self.write_log("OneBSS vẫn đang xử lý; tiếp tục chờ, chưa xuất Excel...")

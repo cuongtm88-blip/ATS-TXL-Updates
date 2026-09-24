@@ -24,10 +24,74 @@ def fake_onebss_grid_snapshot(total_count=2):
         row["Mã báo hỏng"] = f"FAKE-ID-{number}"
         row["Số ảo"] = f"FAKE-VIRTUAL-{number}"
         rows.append(row)
-    return {"total_count": total_count, "detected_headers": headers, "rows": rows}
+    return {
+        "total_count": total_count,
+        "detected_headers": headers,
+        "current_page_size": 10,
+        "current_page": 1,
+        "rows": rows,
+    }
+
+
+def fake_onebss_grid_rows(start, count):
+    headers = [mapping[0] for mapping in app.ONEBSS_UI_COLUMN_MAPPING]
+    rows = []
+    for number in range(start, start + count):
+        row = {header: f"FAKE-{header}-{number}" for header in headers}
+        row["Mã báo hỏng"] = f"FAKE-ID-{number}"
+        rows.append(row)
+    return rows
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_onebss_grid_collects_all_required_total_sizes(self):
+        cases = (
+            (0, 10, 0), (1, 10, 1), (10, 10, 1), (11, 20, 1),
+            (37, 50, 1), (67, 100, 1), (200, 200, 1), (201, 500, 1),
+            (500, 500, 1), (501, 1000, 1), (1000, 1000, 1),
+            (1001, 2000, 1), (2000, 2000, 1), (2001, 2000, 2),
+            (4001, 2000, 3),
+        )
+        headers = [mapping[0] for mapping in app.ONEBSS_UI_COLUMN_MAPPING]
+
+        for total_count, expected_size, expected_pages in cases:
+            with self.subTest(total_count=total_count):
+                state = {"page_size": 10, "page": 1}
+
+                def snapshot():
+                    start = (state["page"] - 1) * state["page_size"] + 1
+                    count = min(state["page_size"], max(total_count - start + 1, 0))
+                    return {
+                        "detected_headers": headers,
+                        "current_page_size": state["page_size"],
+                        "current_page": state["page"],
+                        "rows": fake_onebss_grid_rows(start, count),
+                    }
+
+                initial = snapshot()
+                if total_count == 0:
+                    initial["rows"] = []
+                aggregate = app._collect_onebss_grid_pages(
+                    total_count,
+                    initial,
+                    lambda size: state.update(page_size=size, page=1),
+                    snapshot,
+                    lambda page_number: state.update(page=page_number),
+                )
+                parsed = app._parse_onebss_grid_snapshot(aggregate)
+
+                self.assertEqual(aggregate["selected_page_size"], expected_size)
+                self.assertEqual(aggregate["pages_read"], expected_pages)
+                self.assertEqual(parsed["metadata"]["row_count"], total_count)
+                self.assertEqual(parsed["metadata"]["unique_ma_bh_count"], total_count)
+                self.assertEqual(parsed["metadata"]["result"], "PASS")
+
+    def test_onebss_total_count_parser_handles_grouping_and_zero(self):
+        self.assertEqual(app._parse_onebss_total_count("Tổng cộng 67 bản ghi"), 67)
+        self.assertEqual(app._parse_onebss_total_count("Tổng cộng 4.001 bản ghi"), 4001)
+        self.assertEqual(app._parse_onebss_total_count("Tổng cộng 0 bản ghi"), 0)
+        self.assertIsNone(app._parse_onebss_total_count("Không có thông tin tổng"))
+
     def test_onebss_grid_reader_maps_all_25_headers(self):
         parsed = app._parse_onebss_grid_snapshot(fake_onebss_grid_snapshot())
 
@@ -162,7 +226,7 @@ class RecoveryTests(unittest.TestCase):
             app, "APP_DATA", Path(temporary)
         ):
             with self.assertRaises(app.DiagnosticTestCompleted):
-                state._run_onebss_grid_diagnostic(page)
+                state._run_onebss_grid_diagnostic(page, 2)
             report = state._last_diagnostic_path / "onebss-grid-diagnostic.json"
             serialized = report.read_text(encoding="utf-8")
 
@@ -254,6 +318,7 @@ class RecoveryTests(unittest.TestCase):
         state._last_diagnostic_path = None
         state._ensure_onebss_session_active = Mock()
         state._wait_for_search_complete = Mock()
+        state._wait_for_search_complete.return_value = 2
         state._run_onebss_grid_diagnostic = Mock(
             side_effect=app.DiagnosticTestCompleted("probe complete")
         )
@@ -269,7 +334,7 @@ class RecoveryTests(unittest.TestCase):
             app.ATSApp._export_excel(state, page, context)
 
         page.get_by_text.assert_called_once_with("Tìm kiếm", exact=True)
-        state._run_onebss_grid_diagnostic.assert_called_once_with(page)
+        state._run_onebss_grid_diagnostic.assert_called_once_with(page, 2)
         state._probe_result_grid.assert_not_called()
         state._run_export_test_d.assert_not_called()
         state._finish_export_diagnostic.assert_not_called()
