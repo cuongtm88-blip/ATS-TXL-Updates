@@ -95,6 +95,151 @@ ONEBSS_EXPIRY_WARNING_SECONDS = 15 * 60
 MAX_EXCEL_CAPTURE_BYTES = 100 * 1024 * 1024
 TEST_D_CHUNK_BYTES = 512 * 1024
 TEST_D_HOOK_VERSION = '1.1.20-diagnostic'
+GRID_PROBE_FIELDS = (
+    "tentinh", "ten_tb", "ma_tb", "loaihinh_tb", "ten_dv", "ten_nv",
+    "ma_bh", "ghichu_hong", "dienthoai_lh", "ten_trangthai",
+    "trangthai_bh", "ten_dv_xl", "ten_dv_dang_th", "ngay_bh",
+)
+GRID_PROBE_SCRIPT = r"""(atsFields) => {
+    const cleanName = value => typeof value === 'string' &&
+        /^[A-Za-z_$][A-Za-z0-9_$.-]{0,79}$/.test(value) ? value : '';
+    const safeClasses = element => element ? [...element.classList]
+        .filter(name => /^[A-Za-z0-9_-]{1,60}$/.test(name)).slice(0, 20) : [];
+    const gridRoots = [...document.querySelectorAll('.e-grid, [role="grid"]')];
+    const headerTexts = element => [...element.querySelectorAll('th,[role="columnheader"]')]
+        .map(node => (node.textContent || '').trim()).filter(Boolean);
+    const root = gridRoots.find(element => {
+        const headers = headerTexts(element);
+        return headers.includes('Mã thuê bao') && headers.includes('Ngày báo hỏng');
+    }) || null;
+    const tables = root ? [...root.querySelectorAll('table')] : [];
+    const contentTable = tables
+        .map(table => ({table, rows: [...table.querySelectorAll('tbody tr')]
+            .filter(row => row.querySelectorAll('td').length > 0 &&
+                row.closest('.e-grid') === root &&
+                !row.matches('.e-filterbar, .e-emptyrow, .e-summaryrow, [aria-hidden="true"]'))}))
+        .sort((left, right) => right.rows.length - left.rows.length)[0];
+    const rows = contentTable?.rows || [];
+    const pager = root?.querySelector('.e-pager, [class*="pager"]') || null;
+    const pageSizeInput = pager?.querySelector(
+        '.e-dropdownlist input, input[role="combobox"], input'
+    ) || null;
+    const columns = root?.ej2_instances?.flatMap(instance => {
+        try {
+            return typeof instance.getColumns === 'function'
+                ? [{instance, columns: instance.getColumns()}] : [];
+        } catch (_) { return []; }
+    })[0] || null;
+    const mappings = (columns?.columns || []).map(column => ({
+        field: cleanName(column.field) || null,
+        headerText: typeof column.headerText === 'string' ? column.headerText.slice(0, 120) : ''
+    }));
+    let rawKeys = [];
+    const firstRow = rows[0];
+    if (firstRow && columns?.instance && typeof columns.instance.getRowObjectFromUID === 'function') {
+        try {
+            const uid = firstRow.getAttribute('data-uid');
+            const raw = uid ? columns.instance.getRowObjectFromUID(uid)?.data : null;
+            if (raw && typeof raw === 'object') rawKeys = Object.keys(raw).map(cleanName).filter(Boolean);
+        } catch (_) {}
+    }
+    let totalCount = null;
+    const pagerText = pager?.textContent || '';
+    const totalMatch = pagerText.match(/Tổng cộng\s*(\d+)\s*bản ghi/i);
+    if (totalMatch) totalCount = Number(totalMatch[1]);
+    const pageSizeMatch = String(pageSizeInput?.value || '').match(/\d+/);
+    const virtualMarkers = root ? [
+        '.e-virtualtrack', '.e-virtualtable', '.e-virtualscroll', '.e-virtual-height'
+    ].filter(selector => root.querySelector(selector)) : [];
+    let virtualization = 'inconclusive';
+    if (virtualMarkers.length) virtualization = 'virtualized';
+    else if (totalCount !== null && pageSizeMatch && Number(pageSizeMatch[0]) >= totalCount &&
+             rows.length === totalCount) virtualization = 'not-detected-complete-page';
+    const structure = {
+        grid_root: root ? {selector_hint: '.e-grid / [role="grid"]', tag: root.tagName.toLowerCase(), classes: safeClasses(root)} : null,
+        rows: contentTable ? {selector_hint: 'grid content table tbody tr', tag: contentTable.table.tagName.toLowerCase(), classes: safeClasses(contentTable.table), row_classes: safeClasses(rows[0])} : null,
+        page_size: pageSizeInput ? {selector_hint: 'grid pager dropdown input', tag: pageSizeInput.tagName.toLowerCase(), classes: safeClasses(pageSizeInput.closest('.e-dropdownlist') || pageSizeInput)} : null,
+        pagination: pager ? {selector_hint: 'grid .e-pager', tag: pager.tagName.toLowerCase(), classes: safeClasses(pager)} : null,
+        virtualization_markers: virtualMarkers
+    };
+    return {
+        total_count: totalCount,
+        current_page_size: pageSizeMatch ? Number(pageSizeMatch[0]) : null,
+        dom_row_count: rows.length,
+        headers: columns?.columns?.length
+            ? columns.columns.map(column => typeof column.headerText === 'string' ? column.headerText.slice(0, 120) : '')
+            : headerTexts(root || document.createElement('div')).slice(0, 80),
+        selector_structure: structure,
+        grid_component_type: columns?.instance?.constructor?.name || root?.classList?.contains('e-grid') && 'Syncfusion EJ2 Grid' || null,
+        column_field_header_mapping: mappings,
+        raw_first_row_keys: [...new Set(rawKeys)],
+        ats_field_presence: Object.fromEntries(atsFields.map(field => [field, rawKeys.includes(field)])),
+        virtualization_state: virtualization
+    };
+}"""
+
+
+def _sanitize_grid_probe_result(raw):
+    """Return a strict metadata-only allowlist; never persist row objects/values."""
+    raw = raw if isinstance(raw, dict) else {}
+    safe_name = lambda value: value if isinstance(value, str) and re.fullmatch(
+        r"[A-Za-z_$][A-Za-z0-9_$.-]{0,79}", value
+    ) else ""
+    safe_text = lambda value: " ".join(str(value).split())[:120] if isinstance(value, str) else ""
+    safe_int = lambda value: value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    safe_string_list = lambda values, limit: [
+        safe_text(value) for value in values[:limit] if isinstance(value, str)
+    ] if isinstance(values, list) else []
+    structure = raw.get("selector_structure") if isinstance(raw.get("selector_structure"), dict) else {}
+    safe_structure = {}
+    for section in ("grid_root", "rows", "page_size", "pagination"):
+        item = structure.get(section)
+        if not isinstance(item, dict):
+            safe_structure[section] = None
+            continue
+        safe_structure[section] = {
+            "selector_hint": safe_text(item.get("selector_hint")),
+            "tag": safe_text(item.get("tag")),
+            "classes": safe_string_list(item.get("classes"), 20),
+        }
+        if section == "rows":
+            safe_structure[section]["row_classes"] = safe_string_list(item.get("row_classes"), 20)
+    safe_structure["virtualization_markers"] = [
+        value for value in safe_string_list(structure.get("virtualization_markers"), 10)
+        if re.fullmatch(r"\.[A-Za-z0-9_-]{1,80}", value)
+    ]
+    mappings = raw.get("column_field_header_mapping")
+    safe_mappings = [
+        {"field": safe_name(item.get("field")) or None, "headerText": safe_text(item.get("headerText"))}
+        for item in mappings[:80] if isinstance(item, dict)
+    ] if isinstance(mappings, list) else []
+    keys = raw.get("raw_first_row_keys")
+    safe_keys = sorted({safe_name(value) for value in keys[:300] if safe_name(value)}) if isinstance(keys, list) else []
+    presence = raw.get("ats_field_presence")
+    safe_presence = {
+        field: bool(presence.get(field, False)) if isinstance(presence, dict) else False
+        for field in GRID_PROBE_FIELDS
+    }
+    safe_headers = safe_string_list(raw.get("headers"), 80)
+    safe_mappings = [
+        {"field": item["field"], "headerText": item["headerText"]}
+        for item in safe_mappings
+        if item["headerText"] in safe_headers or not item["headerText"]
+    ]
+    return {
+        "total_count": safe_int(raw.get("total_count")),
+        "current_page_size": safe_int(raw.get("current_page_size")),
+        "dom_row_count": safe_int(raw.get("dom_row_count")) or 0,
+        "headers": safe_headers,
+        "selector_structure": safe_structure,
+        "grid_component_type": safe_text(raw.get("grid_component_type")) or None,
+        "column_field_header_mapping": safe_mappings,
+        "raw_first_row_keys": safe_keys,
+        "ats_field_presence": safe_presence,
+        "virtualization_state": raw.get("virtualization_state") if raw.get("virtualization_state") in {
+            "virtualized", "not-detected-complete-page", "inconclusive"
+        } else "inconclusive",
+    }
 TEST_D_HOOK_SCRIPT = r"""(options) => {
     const {frameId = 'frame-unassigned', observeOnly = false} = options || {};
     if (location.origin !== 'https://onebss.vnpt.vn' || window.__atsTxlTestD) return false;
@@ -2784,12 +2929,36 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             except Exception:
                 continue
 
+    def _probe_result_grid(self, page):
+        """Write a local, metadata-only snapshot of the OneBSS results grid."""
+        try:
+            raw = page.evaluate(GRID_PROBE_SCRIPT, list(GRID_PROBE_FIELDS))
+        except Exception as exc:
+            # Exception strings can contain page/request data; persist only the type.
+            raw = {"virtualization_state": "inconclusive"}
+            self.write_log(f"Grid probe không đọc được DOM ({type(exc).__name__}).")
+        result = _sanitize_grid_probe_result(raw)
+        folder = APP_DATA / DIAGNOSTICS_DIRNAME / (
+            f"grid_probe_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        )
+        folder.mkdir(parents=True, exist_ok=False)
+        report = folder / "grid-probe.json"
+        report.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._last_diagnostic_path = folder
+        self.write_log(f"Đã lưu probe schema-only của bảng OneBSS: {report}")
+        raise DiagnosticTestCompleted(
+            "Grid probe hoàn tất; diagnostic dừng trước Test D và Xuất Excel. "
+            f"Tệp metadata: {report}"
+        )
+
     def _export_excel(self, page, context):
         if page.is_closed():
             raise RuntimeError("Trình duyệt đã đóng. Hãy bấm nút 1 để mở lại OneBSS.")
         self._ensure_onebss_session_active(page)
         self._last_diagnostic_path = None
-        self._begin_export_diagnostic(context, page)
+        probe_only = getattr(self, "deep_diagnostic_mode", False)
+        if not probe_only:
+            self._begin_export_diagnostic(context, page)
         target = DOWNLOADS / ("Bao_hong_ton_" + time.strftime("%Y%m%d%H%M%S") + ".xlsx")
         capture = {"path": None, "error": None, "source": None}
 
@@ -2853,8 +3022,8 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             self.write_log("Bấm Tìm kiếm và chờ tải hết phiếu...")
             page.get_by_text("Tìm kiếm", exact=True).click(timeout=15000)
             self._wait_for_search_complete(page)
-            if getattr(self, "deep_diagnostic_mode", False):
-                self._run_export_test_d(page, context)
+            if probe_only:
+                self._probe_result_grid(page)
             self.write_log("Bấm Xuất Excel...")
             page.evaluate("""() => {
                 window.__atsTxlExportCapture = {armed: true, blobUrl: null};
@@ -2952,7 +3121,8 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             self.write_log(f"Đã lưu Excel: {target}")
             return target
         except Exception as exc:
-            self._finish_export_diagnostic(context, page, exc)
+            if not probe_only:
+                self._finish_export_diagnostic(context, page, exc)
             raise
 
     @staticmethod

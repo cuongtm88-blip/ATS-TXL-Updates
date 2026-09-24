@@ -17,6 +17,104 @@ import updater
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_grid_probe_sanitizer_keeps_only_schema_metadata(self):
+        customer_value = "CUSTOMER-ROW-VALUE-MUST-NOT-LEAK"
+        raw = {
+            "total_count": 60,
+            "current_page_size": 500,
+            "dom_row_count": 60,
+            "headers": ["Tỉnh", "Mã thuê bao"],
+            "selector_structure": {
+                "grid_root": {"selector_hint": ".e-grid", "tag": "div", "classes": ["e-grid"]},
+                "rows": {"selector_hint": "tbody tr", "tag": "table", "classes": [], "row_classes": ["e-row"]},
+                "page_size": {"selector_hint": "pager input", "tag": "input", "classes": ["e-dropdownlist"]},
+                "pagination": {"selector_hint": ".e-pager", "tag": "div", "classes": ["e-pager"]},
+                "virtualization_markers": [],
+            },
+            "grid_component_type": "Grid",
+            "column_field_header_mapping": [
+                {"field": "ma_tb", "headerText": "Mã thuê bao"},
+            ],
+            "raw_first_row_keys": ["ma_tb", "ten_dv"],
+            "ats_field_presence": {"ma_tb": True, "ten_dv": True},
+            "virtualization_state": "inconclusive",
+            "row_values": {"ma_tb": customer_value},
+        }
+
+        sanitized = app._sanitize_grid_probe_result(raw)
+        serialized = json.dumps(sanitized, ensure_ascii=False)
+
+        self.assertNotIn(customer_value, serialized)
+        self.assertEqual(sanitized["headers"], ["Tỉnh", "Mã thuê bao"])
+        self.assertEqual(sanitized["raw_first_row_keys"], ["ma_tb", "ten_dv"])
+        self.assertEqual(sanitized["ats_field_presence"]["ten_dv"], True)
+        self.assertEqual(
+            set(sanitized),
+            {
+                "total_count", "current_page_size", "dom_row_count", "headers",
+                "selector_structure", "grid_component_type", "column_field_header_mapping",
+                "raw_first_row_keys", "ats_field_presence", "virtualization_state",
+            },
+        )
+
+    def test_grid_probe_file_never_persists_row_values(self):
+        customer_value = "PRIVATE-CUSTOMER-ROW-VALUE"
+        state = app.ATSApp.__new__(app.ATSApp)
+        state.write_log = Mock()
+        state._last_diagnostic_path = None
+        state.deep_diagnostic_mode = True
+        state._active_export_diagnostic = None
+        page = Mock()
+        page.evaluate.return_value = {
+            "total_count": 1,
+            "current_page_size": 10,
+            "dom_row_count": 1,
+            "headers": ["Mã thuê bao"],
+            "selector_structure": {},
+            "grid_component_type": "Grid",
+            "column_field_header_mapping": [],
+            "raw_first_row_keys": ["ma_tb"],
+            "ats_field_presence": {"ma_tb": True},
+            "virtualization_state": "inconclusive",
+            "row_values": {"ma_tb": customer_value},
+        }
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            app, "APP_DATA", Path(temporary)
+        ):
+            with self.assertRaises(app.DiagnosticTestCompleted):
+                state._probe_result_grid(page)
+            report = state._last_diagnostic_path / "grid-probe.json"
+            serialized = report.read_text(encoding="utf-8")
+
+        self.assertNotIn(customer_value, serialized)
+        self.assertEqual(page.evaluate.call_args.args[0], app.GRID_PROBE_SCRIPT)
+        self.assertTrue(all(field in serialized for field in app.GRID_PROBE_FIELDS))
+
+    def test_deep_diagnostic_grid_probe_stops_before_test_d_and_export(self):
+        state = app.ATSApp.__new__(app.ATSApp)
+        state.deep_diagnostic_mode = True
+        state._last_diagnostic_path = None
+        state._ensure_onebss_session_active = Mock()
+        state._wait_for_search_complete = Mock()
+        state._probe_result_grid = Mock(
+            side_effect=app.DiagnosticTestCompleted("probe complete")
+        )
+        state._run_export_test_d = Mock()
+        state._finish_export_diagnostic = Mock()
+        state.write_log = Mock()
+        page = Mock()
+        page.is_closed.return_value = False
+        context = object()
+
+        with self.assertRaises(app.DiagnosticTestCompleted):
+            app.ATSApp._export_excel(state, page, context)
+
+        page.get_by_text.assert_called_once_with("Tìm kiếm", exact=True)
+        state._probe_result_grid.assert_called_once_with(page)
+        state._run_export_test_d.assert_not_called()
+        state._finish_export_diagnostic.assert_not_called()
+
     def test_diagnostic_url_redacts_queries_and_identifiers(self):
         url = "https://onebss.vnpt.vn/api/exportExcel/12345678?access_token=secret"
         safe = app.ATSApp._safe_diagnostic_url(url)
