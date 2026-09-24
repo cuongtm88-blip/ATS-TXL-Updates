@@ -1,6 +1,7 @@
 """Regression tests for Windows browser recovery and OneBSS auth detection."""
 
 import io
+import base64
 import json
 import tempfile
 import time
@@ -663,6 +664,291 @@ class RecoveryTests(unittest.TestCase):
                     self.assertNotIn("chromium_sandbox", options)
                 else:
                     self.assertIs(options["chromium_sandbox"], expected)
+
+
+class TestDBlobTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.playwright = app.sync_playwright().start()
+        cls.browser = cls.playwright.chromium.launch(headless=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.browser.close()
+        cls.playwright.stop()
+
+    def _page(self, install=True):
+        context = self.browser.new_context(accept_downloads=True)
+        page = context.new_page()
+        page.route("**/*", lambda route: route.fulfill(
+            status=200, content_type="text/html", body="<html><body>Test D</body></html>"
+        ))
+        page.goto("https://onebss.vnpt.vn/test-d")
+        if install:
+            self.assertTrue(page.evaluate(app.TEST_D_HOOK_SCRIPT))
+            self.assertTrue(page.evaluate("() => window.__atsTxlTestD.arm()"))
+            self.assertTrue(page.evaluate("() => window.__atsTxlTestD.markExportClick()"))
+        self.addCleanup(context.close)
+        return page
+
+    @staticmethod
+    def _click_blob(page, mime, filename, mode="programmatic"):
+        return page.evaluate("""([mime, filename, mode]) => {
+            const blob = new Blob(['test'], {type: mime});
+            const anchor = document.createElement('a');
+            anchor.href = URL.createObjectURL(blob);
+            anchor.download = filename;
+            document.body.append(anchor);
+            if (mode === 'event') {
+                anchor.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+            } else {
+                anchor.click();
+            }
+            return window.__atsTxlTestD.metadata();
+        }""", [mime, filename, mode])
+
+    def test_test_d_accepts_xlsx_with_excel_octet_stream_or_empty_mime(self):
+        for mime in (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/octet-stream", "",
+        ):
+            with self.subTest(mime=mime):
+                page = self._page()
+                downloads = []
+                page.on("download", lambda item: downloads.append(item))
+                result = self._click_blob(page, mime, "export.xlsx")
+                page.wait_for_timeout(100)
+                self.assertEqual(result["state"], "captured")
+                self.assertEqual(result["suppressed_count"], 1)
+                self.assertFalse(downloads)
+
+    def test_test_d_does_not_suppress_unrelated_blob(self):
+        page = self._page()
+        downloads = []
+        page.on("download", lambda item: downloads.append(item))
+        result = self._click_blob(page, "application/pdf", "other.pdf")
+        page.wait_for_timeout(200)
+        self.assertEqual(result["state"], "armed")
+        self.assertEqual(result["suppressed_count"], 0)
+        self.assertEqual(len(downloads), 1)
+
+    def test_test_d_does_not_suppress_contradictory_pdf_mime(self):
+        page = self._page()
+        downloads = []
+        page.on("download", lambda item: downloads.append(item))
+        result = self._click_blob(page, "application/pdf", "misnamed.xlsx")
+        page.wait_for_timeout(200)
+        self.assertEqual(result["state"], "armed")
+        self.assertEqual(result["suppressed_count"], 0)
+        self.assertEqual(len(downloads), 1)
+
+    def test_test_d_capture_click_event_and_duplicate_click(self):
+        page = self._page()
+        downloads = []
+        page.on("download", lambda item: downloads.append(item))
+        result = self._click_blob(page, "", "export.xlsx", mode="event")
+        self.assertEqual(result["suppressed_count"], 1)
+        page.evaluate("() => document.querySelector('a').click()")
+        page.wait_for_timeout(100)
+        result = page.evaluate("() => window.__atsTxlTestD.metadata()")
+        self.assertEqual(result["suppressed_count"], 2)
+        self.assertFalse(result["multiple_candidates"])
+        self.assertFalse(downloads)
+
+    def test_test_d_keeps_blob_after_onebss_revokes_url(self):
+        page = self._page()
+        self._click_blob(page, "", "export.xlsx")
+        result = page.evaluate("""async () => {
+            URL.revokeObjectURL(document.querySelector('a').href);
+            return window.__atsTxlTestD.readChunk(0, 4);
+        }""")
+        self.assertEqual(base64.b64decode(result), b"test")
+
+    def test_test_d_cleanup_restores_original_browser_functions(self):
+        page = self._page(install=False)
+        page.evaluate("""() => {
+            window.originalCreate = URL.createObjectURL;
+            window.originalClick = HTMLAnchorElement.prototype.click;
+        }""")
+        self.assertTrue(page.evaluate(app.TEST_D_HOOK_SCRIPT))
+        page.evaluate("() => window.__atsTxlTestD.cleanup()")
+        restored = page.evaluate("""() => ({
+            create: URL.createObjectURL === window.originalCreate,
+            click: HTMLAnchorElement.prototype.click === window.originalClick,
+            stateReleased: window.__atsTxlTestD === undefined
+        })""")
+        self.assertEqual(restored, {"create": True, "click": True, "stateReleased": True})
+
+    def test_test_d_reconstructs_multiple_chunks_and_validates_workbook(self):
+        from openpyxl import Workbook
+        workbook = Workbook()
+        workbook.active.append(["value", 123])
+        source = io.BytesIO()
+        workbook.save(source)
+        workbook.close()
+        original = source.getvalue()
+        page = self._page()
+        page.evaluate("""encoded => {
+            const binary = atob(encoded);
+            const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+            const anchor = document.createElement('a');
+            anchor.href = URL.createObjectURL(new Blob([bytes], {type: 'application/octet-stream'}));
+            anchor.download = 'report.xlsx';
+            document.body.append(anchor);
+            anchor.click();
+        }""", base64.b64encode(original).decode("ascii"))
+        metadata = page.evaluate("() => window.__atsTxlTestD.metadata()")
+        state = app.ATSApp.__new__(app.ATSApp)
+        state.write_log = Mock()
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            app, "DOWNLOADS", Path(temporary)
+        ), patch.object(app, "TEST_D_CHUNK_BYTES", 128):
+            result = state._transfer_test_d_blob(page, metadata)
+            saved = list(Path(temporary).glob("*.xlsx"))
+            self.assertEqual(result["state"], "saved")
+            self.assertEqual(result["bytes_transferred"], len(original))
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0].read_bytes(), original)
+            self.assertFalse(list(Path(temporary).glob("*.partial.xlsx")))
+
+    def test_test_d_size_limit_and_corrupt_xlsx(self):
+        state = app.ATSApp.__new__(app.ATSApp)
+        page = Mock()
+        result = state._transfer_test_d_blob(
+            page, {"blob_size": app.MAX_EXCEL_CAPTURE_BYTES + 1}
+        )
+        self.assertEqual(result["state"], "size-limit")
+        page.evaluate.assert_not_called()
+        with tempfile.TemporaryDirectory() as temporary:
+            bad = Path(temporary) / "bad.xlsx"
+            bad.write_bytes(b"PK not a zip")
+            with self.assertRaises(zipfile.BadZipFile):
+                state._validate_test_d_xlsx(bad)
+
+    def test_test_d_result_conditions(self):
+        meta = {"state": "captured", "suppressed_count": 1,
+                "multiple_candidates": False, "blob_size": 123}
+        transfer = {"state": "saved", "bytes_transferred": 123,
+                    "pk": True, "zip": True, "xlsx_structure": True, "openpyxl": True}
+        alive = "TEST C RESULT: Chrome remained alive for 30 seconds after Blob download."
+        classify = app.ATSApp._classify_test_d
+        self.assertIn("PASS", classify(meta, transfer, alive, {}))
+        self.assertIn("FAIL", classify(meta, transfer, alive, {"download_event_seen": True}))
+        self.assertIn("FAIL", classify(meta, transfer, alive,
+                                      {"close_reason": "unexpected-browser-exit"}))
+        self.assertIn("FAIL", classify(meta, {"state": "corrupt"}, alive, {}))
+        self.assertIn("INCONCLUSIVE", classify({"state": "armed"}, transfer, alive, {}))
+        self.assertIn("INCONCLUSIVE", classify(meta, {"state": "size-limit"}, alive, {}))
+        self.assertIn("FAIL", classify(meta, {**transfer, "bytes_transferred": 122}, alive, {}))
+
+    def test_test_d_download_listener_does_not_read_download_object(self):
+        context = Mock()
+        page = Mock()
+        state = app.ATSApp.__new__(app.ATSApp)
+        state._active_export_diagnostic = {
+            "context": context, "network_armed": True, "test_d_active": True,
+            "events": [], "network_events": [], "page_ids": {},
+        }
+        state._diagnostic_page_ids = set()
+        state._attach_page_diagnostics(context, page)
+        handler = next(call.args[1] for call in page.on.call_args_list
+                       if call.args[0] == "download")
+        class ForbiddenDownload:
+            @property
+            def suggested_filename(self):
+                raise AssertionError("Download object accessed")
+            @property
+            def url(self):
+                raise AssertionError("Download object accessed")
+        handler(ForbiddenDownload())
+        active = state._active_export_diagnostic
+        self.assertTrue(active["download_event_seen"])
+        self.assertEqual(active["network_events"][-1]["decision"], "fail")
+
+    def test_test_d_full_synthetic_export_bypasses_download_event_and_stays_alive_30s(self):
+        from openpyxl import Workbook
+        workbook = Workbook()
+        workbook.active.append(["ticket", "test"])
+        source = io.BytesIO()
+        workbook.save(source)
+        workbook.close()
+        page = self._page(install=False)
+        context = page.context
+        page.evaluate("""encoded => {
+            const button = document.createElement('button');
+            button.textContent = 'Xuất Excel';
+            button.onclick = () => {
+                const binary = atob(encoded);
+                const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+                const anchor = document.createElement('a');
+                anchor.href = URL.createObjectURL(new Blob([bytes], {type: 'application/octet-stream'}));
+                anchor.download = 'onebss.xlsx';
+                anchor.click();
+                URL.revokeObjectURL(anchor.href);
+            };
+            document.body.append(button);
+        }""", base64.b64encode(source.getvalue()).decode("ascii"))
+        state = app.ATSApp.__new__(app.ATSApp)
+        active = {"context": context, "events": [], "network_events": [],
+                  "page_ids": {}, "main_browser_process": {"pid": 1}}
+        state._active_export_diagnostic = active
+        state._diagnostic_page_ids = set()
+        state.write_log = Mock()
+        state._finish_export_diagnostic = Mock()
+        state._attach_page_diagnostics(context, page)
+        def observe(_page, _context, observed_active, duration_seconds):
+            self.assertEqual(duration_seconds, 30)
+            started = time.monotonic()
+            while time.monotonic() - started < duration_seconds:
+                self.assertTrue(self.browser.is_connected())
+                self.assertFalse(page.is_closed())
+                self.assertEqual(page.evaluate("() => document.title"), "")
+                self.assertFalse(observed_active.get("download_event_seen"))
+                page.wait_for_timeout(1000)
+            observed_active["close_reason"] = "application-cleanup"
+            return "TEST C RESULT: Chrome remained alive for 30 seconds after Blob download."
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            app, "DOWNLOADS", Path(temporary)
+        ), patch.object(app.ATSApp, "_observe_test_c", side_effect=observe):
+            with self.assertRaises(app.DiagnosticTestCompleted) as completed:
+                state._run_export_test_d(page, context)
+            self.assertEqual(len(list(Path(temporary).glob("*.xlsx"))), 1)
+        self.assertIn("TEST D PASS", str(completed.exception))
+        self.assertFalse(active.get("download_event_seen"))
+        self.assertEqual(active["test_d"]["validation"], "saved")
+
+    def test_test_d_cleanup_starts_after_observation(self):
+        context = Mock()
+        page = Mock(url="https://onebss.vnpt.vn/test-d")
+        page.is_closed.return_value = False
+        sequence = []
+        active = {"context": context, "events": [], "network_events": [],
+                  "download_event_seen": False, "close_reason": "application-cleanup"}
+        state = app.ATSApp.__new__(app.ATSApp)
+        state._active_export_diagnostic = active
+        state.write_log = Mock(side_effect=lambda message: sequence.append(message))
+        state._finish_export_diagnostic = Mock()
+        captured = {"state": "captured", "filename": "export.xlsx", "mime_type": "",
+                    "blob_size": 123, "suppressed_count": 1, "multiple_candidates": False}
+        def evaluate(script):
+            if script == app.TEST_D_HOOK_SCRIPT or ".arm()" in script or ".markExportClick()" in script:
+                return True
+            if ".metadata()" in script:
+                return captured
+            return None
+        page.evaluate.side_effect = evaluate
+        with patch.object(app.ATSApp, "_transfer_test_d_blob", return_value={
+            "state": "saved", "bytes_transferred": 123,
+            "pk": True, "zip": True, "xlsx_structure": True, "openpyxl": True,
+        }), patch.object(app.ATSApp, "_observe_test_c", side_effect=lambda *args, **kwargs: (
+            sequence.append("observe") or
+            "TEST C RESULT: Chrome remained alive for 30 seconds after Blob download."
+        )), self.assertRaises(app.DiagnosticTestCompleted):
+            context.close.side_effect = lambda: sequence.append("context.close")
+            state._run_export_test_d(page, context)
+        self.assertLess(sequence.index("observe"), sequence.index("DIAGNOSTIC CLEANUP STARTED"))
+        self.assertLess(sequence.index("DIAGNOSTIC CLEANUP STARTED"), sequence.index("context.close"))
+        self.assertEqual(active["test_d"]["validation"], "saved")
 
 
 if __name__ == "__main__":

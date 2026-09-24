@@ -93,6 +93,102 @@ LEGACY_BROWSER_CHOICES = {
 }
 ONEBSS_EXPIRY_WARNING_SECONDS = 15 * 60
 MAX_EXCEL_CAPTURE_BYTES = 100 * 1024 * 1024
+TEST_D_CHUNK_BYTES = 512 * 1024
+TEST_D_HOOK_SCRIPT = r"""() => {
+    if (location.hostname !== 'onebss.vnpt.vn' || window.__atsTxlTestD) return false;
+    const nativeCreate = URL.createObjectURL;
+    const nativeClick = HTMLAnchorElement.prototype.click;
+    const state = {
+        armed: false, clickedAt: 0, blobs: new Map(), candidate: null,
+        suppressedCount: 0, multipleCandidates: false
+    };
+    const metadata = () => ({
+        state: state.candidate ? 'captured' : state.armed ? 'armed' : 'installed',
+        filename: state.candidate?.filename || '',
+        mime_type: state.candidate?.blob.type || '',
+        blob_size: state.candidate?.blob.size || 0,
+        captured_at: state.candidate?.capturedAt || '',
+        suppressed_count: state.suppressedCount,
+        multiple_candidates: state.multipleCandidates
+    });
+    const candidateFor = anchor => {
+        if (!state.armed || !state.clickedAt || !(anchor instanceof HTMLAnchorElement)) return null;
+        const filename = anchor.download || '';
+        // The filename must be unambiguous; MIME may be blank or octet-stream.
+        if (!/^[^\\/\x00-\x1f]{1,160}\.xlsx$/i.test(filename)) return null;
+        const url = anchor.href;
+        if (!url.startsWith('blob:' + location.origin + '/')) return null;
+        const entry = state.blobs.get(url);
+        if (!entry || entry.createdAt < state.clickedAt ||
+            Date.now() - state.clickedAt > 60000 || entry.blob.size < 1) return null;
+        const mime = entry.blob.type.toLowerCase();
+        if (mime && mime !== 'application/octet-stream' &&
+            mime !== 'application/zip' && !/(excel|spreadsheet|sheet)/.test(mime)) return null;
+        return {url, filename, blob: entry.blob};
+    };
+    const capture = anchor => {
+        const candidate = candidateFor(anchor);
+        if (!candidate) return false;
+        if (state.candidate && state.candidate.url !== candidate.url) {
+            state.multipleCandidates = true;
+        } else if (!state.candidate) {
+            state.candidate = {...candidate, capturedAt: new Date().toISOString()};
+        }
+        state.suppressedCount += 1;
+        return true;
+    };
+    const wrappedCreate = function(...args) {
+        const url = nativeCreate.apply(this, args);
+        if (state.armed && args[0] instanceof Blob) {
+            state.blobs.set(url, {blob: args[0], createdAt: Date.now()});
+        }
+        return url;
+    };
+    const wrappedClick = function(...args) {
+        if (capture(this)) return;
+        return nativeClick.apply(this, args);
+    };
+    const onClick = event => {
+        const anchor = event.target instanceof Element ? event.target.closest('a') : null;
+        if (capture(anchor)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+    };
+    URL.createObjectURL = wrappedCreate;
+    HTMLAnchorElement.prototype.click = wrappedClick;
+    document.addEventListener('click', onClick, true);
+    window.__atsTxlTestD = {
+        arm() { state.armed = true; return true; },
+        markExportClick() { state.clickedAt = Date.now(); return true; },
+        metadata,
+        async readChunk(offset, length) {
+            const blob = state.candidate?.blob;
+            if (!blob || !Number.isSafeInteger(offset) || !Number.isSafeInteger(length) ||
+                offset < 0 || length < 1 || length > 512 * 1024 ||
+                offset + length > blob.size) throw new Error('invalid-test-d-chunk');
+            // Only one bounded slice crosses Playwright's JSON transport at a time.
+            const bytes = new Uint8Array(await blob.slice(offset, offset + length).arrayBuffer());
+            let binary = '';
+            for (let i = 0; i < bytes.length; i += 0x8000) {
+                binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+            }
+            return btoa(binary);
+        },
+        cleanup() {
+            state.armed = false;
+            document.removeEventListener('click', onClick, true);
+            if (URL.createObjectURL === wrappedCreate) URL.createObjectURL = nativeCreate;
+            if (HTMLAnchorElement.prototype.click === wrappedClick) {
+                HTMLAnchorElement.prototype.click = nativeClick;
+            }
+            state.blobs.clear();
+            state.candidate = null;
+            delete window.__atsTxlTestD;
+        }
+    };
+    return true;
+}"""
 
 
 def _normalise_browser_choice(value, default):
@@ -1140,6 +1236,15 @@ class ATSApp(tk.Tk):
             if active and active.get("context") is context:
                 active["download_event_seen"] = True
                 active["download_event_monotonic"] = time.monotonic()
+                if active.get("test_d_active"):
+                    # Test D uses this event solely as a failure signal; do
+                    # not read even metadata from Playwright's Download object.
+                    self._record_network_event(
+                        context, event_type="TEST D DOWNLOAD EVENT DETECTED",
+                        page_id=self._diagnostic_page_id(context, page),
+                        decision="fail",
+                    )
+                    return
             self._record_diagnostic_event(
                 context,
                 "DOWNLOAD EVENT DETECTED",
@@ -2009,6 +2114,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "windows_dump_count": len(dump_paths),
             "windows_dumps": dump_paths,
             "test_c_result": active.get("test_c_result", ""),
+            "test_d": active.get("test_d", {}),
             "main_browser_process": active.get("main_browser_process"),
             "close_reason": active.get("close_reason", ""),
             "deep_diagnostic_mode": getattr(self, "deep_diagnostic_mode", False),
@@ -2667,7 +2773,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             page.get_by_text("Tìm kiếm", exact=True).click(timeout=15000)
             self._wait_for_search_complete(page)
             if getattr(self, "deep_diagnostic_mode", False):
-                self._run_export_test_a(page, context)
+                self._run_export_test_d(page, context)
             self.write_log("Bấm Xuất Excel...")
             page.evaluate("""() => {
                 window.__atsTxlExportCapture = {armed: true, blobUrl: null};
@@ -2767,6 +2873,206 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
         except Exception as exc:
             self._finish_export_diagnostic(context, page, exc)
             raise
+
+    @staticmethod
+    def _validate_test_d_xlsx(path):
+        """Validate the streamed file without loading the whole workbook into RAM."""
+        with Path(path).open("rb") as stream:
+            if stream.read(2) != b"PK":
+                raise ValueError("missing-pk-magic")
+        with zipfile.ZipFile(path) as workbook:
+            entries = set(workbook.namelist())
+            if not {"[Content_Types].xml", "xl/workbook.xml"} <= entries:
+                raise ValueError("missing-xlsx-entries")
+            if sum(item.file_size for item in workbook.infolist()) > 512 * 1024 * 1024:
+                raise ValueError("zip-expanded-too-large")
+            if workbook.testzip() is not None:
+                raise ValueError("zip-crc-failed")
+        from openpyxl import load_workbook
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        try:
+            if not workbook.sheetnames:
+                raise ValueError("workbook-has-no-sheets")
+        finally:
+            workbook.close()
+
+    def _transfer_test_d_blob(self, page, metadata):
+        size = metadata["blob_size"]
+        if size > MAX_EXCEL_CAPTURE_BYTES:
+            return {"state": "size-limit", "bytes_transferred": 0}
+        DOWNLOADS.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d%H%M%S")
+        unique = uuid.uuid4().hex[:10]
+        target = DOWNLOADS / f"Bao_hong_ton_TestD_{stamp}_{unique}.xlsx"
+        temporary = target.with_name(target.stem + ".partial.xlsx")
+        transferred = 0
+        try:
+            with temporary.open("xb") as stream:
+                while transferred < size:
+                    length = min(TEST_D_CHUNK_BYTES, size - transferred)
+                    encoded = page.evaluate(
+                        "([offset, length]) => window.__atsTxlTestD.readChunk(offset, length)",
+                        [transferred, length],
+                    )
+                    chunk = base64.b64decode(encoded, validate=True)
+                    if len(chunk) != length:
+                        raise ValueError("chunk-length-mismatch")
+                    stream.write(chunk)
+                    transferred += length
+            self._validate_test_d_xlsx(temporary)
+            # A hard link claims the final name atomically and never overwrites.
+            os.link(temporary, target)
+            temporary.unlink()
+            self.write_log(f"Test D đã lưu XLSX: {target}")
+            return {"state": "saved", "bytes_transferred": transferred,
+                    "pk": True, "zip": True, "xlsx_structure": True,
+                    "openpyxl": True}
+        except (ValueError, zipfile.BadZipFile) as exc:
+            return {"state": "corrupt", "bytes_transferred": transferred,
+                    "validation_error": str(exc)[:60]}
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _classify_test_d(metadata, transfer, observation, active):
+        if active.get("download_event_seen"):
+            return "TEST D FAIL: Chrome Download Manager was not bypassed."
+        if (
+            active.get("close_reason") == "unexpected-browser-exit"
+            or active.get("page_crashed") or active.get("page_closed")
+            or active.get("context_closed") or active.get("browser_disconnected")
+        ):
+            return "TEST D FAIL: Chrome or its page/context exited unexpectedly."
+        if transfer.get("state") in ("corrupt", "transfer-failed"):
+            return "TEST D FAIL: Captured XLSX is corrupt or chunk transfer failed."
+        if metadata.get("state") != "captured" or metadata.get("multiple_candidates"):
+            return "TEST D INCONCLUSIVE: Excel Blob was not identified unambiguously."
+        if transfer.get("state") == "size-limit":
+            return "TEST D INCONCLUSIVE: Excel Blob exceeds the 100 MiB safety limit."
+        if transfer.get("state") != "saved" or metadata.get("suppressed_count", 0) < 1:
+            return "TEST D INCONCLUSIVE: Excel Blob capture or suppression was not verified."
+        if (
+            metadata.get("blob_size", 0) < 1
+            or transfer.get("bytes_transferred") != metadata["blob_size"]
+            or not all(transfer.get(key) is True for key in
+                       ("pk", "zip", "xlsx_structure", "openpyxl"))
+        ):
+            return "TEST D FAIL: Saved XLSX did not pass all byte and workbook checks."
+        if observation != "TEST C RESULT: Chrome remained alive for 30 seconds after Blob download.":
+            return "TEST D INCONCLUSIVE: Main Chrome PID could not be verified for 30 seconds."
+        return (
+            "TEST D PASS: Excel Blob captured and saved without Chrome Download Manager. "
+            "Chrome remained alive for 30 seconds."
+        )
+
+    def _run_export_test_d(self, page, context):
+        """Capture one high-confidence XLSX Blob before Chrome receives a download."""
+        active = self._active_export_diagnostic
+        active["network_armed"] = True
+        active["test_d_active"] = True
+        metadata = {"state": "not-installed", "filename": "", "mime_type": "",
+                    "blob_size": 0, "suppressed_count": 0, "multiple_candidates": False}
+        transfer = {"state": "not-started", "bytes_transferred": 0}
+        observation = ""
+        clicked = False
+        observation_started = False
+        try:
+            if urlsplit(page.url).hostname != "onebss.vnpt.vn":
+                metadata["state"] = "wrong-origin"
+            elif not page.evaluate(TEST_D_HOOK_SCRIPT):
+                metadata["state"] = "installation-failed"
+            elif not page.evaluate("() => window.__atsTxlTestD.arm()"):
+                metadata["state"] = "arm-failed"
+            elif not page.evaluate("() => window.__atsTxlTestD.markExportClick()"):
+                metadata["state"] = "arm-failed"
+            else:
+                self.write_log("Bấm Xuất Excel... (Test D: chặn Blob trước Chrome Download Manager)")
+                clicked = True
+                try:
+                    page.get_by_text("Xuất Excel", exact=True).click(timeout=15000)
+                except Exception as exc:
+                    self._record_network_event(
+                        context, event_type="test-d-export-click-error",
+                        error_type=type(exc).__name__, decision="observed",
+                    )
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    if active.get("download_event_seen") or page.is_closed() or active.get("browser_disconnected"):
+                        break
+                    metadata = page.evaluate("() => window.__atsTxlTestD.metadata()")
+                    if metadata["state"] == "captured":
+                        break
+                    page.wait_for_timeout(100)
+                if metadata["state"] == "captured" and not active.get("download_event_seen"):
+                    try:
+                        transfer = self._transfer_test_d_blob(page, metadata)
+                    except Exception as exc:
+                        transfer = {"state": "transfer-failed", "bytes_transferred": 0,
+                                    "error_type": type(exc).__name__}
+                observation_started = True
+                observation = self._observe_test_c(page, context, active, duration_seconds=30)
+                if not page.is_closed():
+                    try:
+                        metadata = page.evaluate("() => window.__atsTxlTestD.metadata()")
+                    except Exception:
+                        pass
+        except Exception as exc:
+            self._record_network_event(
+                context, event_type="test-d-instrumentation-error",
+                error_type=type(exc).__name__, decision="observed",
+            )
+            if clicked and not observation_started:
+                try:
+                    observation = self._observe_test_c(page, context, active, duration_seconds=30)
+                except Exception:
+                    observation = "TEST C RESULT: INCONCLUSIVE; process observation failed."
+            else:
+                if not clicked:
+                    metadata["state"] = "instrumentation-failed"
+        finally:
+            try:
+                if page.is_closed():
+                    active["page_closed"] = True
+            except Exception:
+                pass
+            active["test_d"] = {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                **metadata,
+                "chunk_size": TEST_D_CHUNK_BYTES,
+                "bytes_transferred": transfer.get("bytes_transferred", 0),
+                "validation": transfer.get("state", "not-started"),
+                "validation_results": {key: transfer.get(key, False) for key in
+                    ("pk", "zip", "xlsx_structure", "openpyxl")},
+                "download_event_seen": bool(active.get("download_event_seen")),
+                "main_pid_state": (
+                    "alive" if "remained alive for 30 seconds" in observation
+                    else "exited" if "terminated independently" in observation
+                    else "unverified"
+                ),
+                "observation_result": observation,
+            }
+            result = self._classify_test_d(metadata, transfer, observation, active)
+            self.write_log(result)
+            self.write_log("DIAGNOSTIC CLEANUP STARTED")
+            self._record_test_c_timeline(context, "DIAGNOSTIC CLEANUP STARTED")
+            try:
+                if not page.is_closed():
+                    page.evaluate("() => window.__atsTxlTestD?.cleanup()")
+            except Exception:
+                pass
+            self.write_log("ATS-TXL is now intentionally closing the browser.")
+            try:
+                context.close()
+            except Exception as exc:
+                self._record_test_c_timeline(
+                    context, "DIAGNOSTIC CLEANUP ERROR", error_type=type(exc).__name__
+                )
+            self.write_log("DIAGNOSTIC CLEANUP FINISHED")
+            self._record_test_c_timeline(context, "DIAGNOSTIC CLEANUP FINISHED")
+            active["network_armed"] = False
+            active["test_d_active"] = False
+            self._finish_export_diagnostic(context, page, RuntimeError(result))
+        raise DiagnosticTestCompleted(result)
 
     def _run_export_test_a(self, page, context):
         """Observe a browser-context export request and block only a clearly named export route."""
