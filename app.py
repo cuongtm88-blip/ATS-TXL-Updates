@@ -551,7 +551,7 @@ ONEBSS_PAGE_SIZE_STATE_SCRIPT = r"""(allowedSizes) => {
         return headers.some(value => value.includes(norm('Mã thuê bao'))) &&
             headers.some(value => value.includes(norm('Mã báo hỏng')));
     });
-    if (!root) return {page_size_control_found: false, page_size_control_value: null, initial_page_size_detected: null, footer: '', dropdown_opened: false, options: [], popup_index: null};
+    if (!root) return {page_size_control_found: false, page_size_control_value: null, ej2_page_size: null, selected_option_value: null, initial_page_size_detected: null, footer: '', dropdown_opened: false, options: [], popup_index: null};
     const visible = element => {
         const style = getComputedStyle(element);
         const rect = element.getBoundingClientRect();
@@ -593,6 +593,9 @@ ONEBSS_PAGE_SIZE_STATE_SCRIPT = r"""(allowedSizes) => {
         .map(text => /^\d+$/.test(text) ? Number(text) : null)
         .filter(value => allowedSizes.includes(value));
     const popup = associatedPopups[0] || openPopups.find(element => numericOptions(element).length) || null;
+    const selectedOption = popup?.querySelector('.e-list-item.e-active, .e-list-item[aria-selected="true"]') || null;
+    const gridInstance = root.ej2_instances?.find(item => item.pageSettings && typeof item.getColumns === 'function');
+    const selectedOptionText = (selectedOption?.innerText || selectedOption?.textContent || '').trim();
     const visiblePopups = [...document.querySelectorAll('.e-popup')].filter(visible);
     const popupIndex = popup ? visiblePopups.indexOf(popup) : -1;
     const range = footer.match(/Đang hiển thị bản ghi số\s*([\d.,]+)\s*đến\s*([\d.,]+)/i);
@@ -605,6 +608,8 @@ ONEBSS_PAGE_SIZE_STATE_SCRIPT = r"""(allowedSizes) => {
     return {
         page_size_control_found: Boolean(pageSizes && pagerDropdown && dropdown && control && visible(pageSizes) && visible(dropdown)),
         page_size_control_value: controlValue,
+        ej2_page_size: Number.isInteger(gridInstance?.pageSettings?.pageSize) ? gridInstance.pageSettings.pageSize : null,
+        selected_option_value: /^\d+$/.test(selectedOptionText) ? Number(selectedOptionText) : null,
         initial_page_size_detected: initialPageSize,
         footer,
         trigger_found: Boolean(trigger && visible(trigger)),
@@ -3542,6 +3547,10 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             "target_page_size": None,
             "target_option_found": False,
             "target_option_clicked": False,
+            "target_option_selected_by_keyboard": False,
+            "page_size_control_value_after_selection": None,
+            "ej2_page_size_after_selection": None,
+            "dropdown_open_after_selection": None,
             "footer_before": "",
             "footer_after": "",
             "grid_rerender_detected": False,
@@ -3656,14 +3665,20 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                 raise RuntimeError("EJ2 page-size popup could not be scoped to its component")
             progress["active_stage"] = "start-grid-rerender-observer"
             observer_started = bool(page.evaluate(ONEBSS_GRID_MUTATION_OBSERVER_SCRIPT, "start"))
-            popup = page.locator(f'[id="{popup_id}"]')
-            option = popup.get_by_text(str(page_size), exact=True).first
-            progress["active_stage"] = "wait-target-page-size-option-visible"
-            option.wait_for(state="visible", timeout=10000)
-            progress["target_option_found"] = True
-            progress["active_stage"] = "click-target-page-size-option"
-            option.click(timeout=10000)
-            progress["target_option_clicked"] = True
+            page_size_input = dropdown.locator("input.e-dropdownlist, input").first
+            progress["active_stage"] = "focus-page-size-input"
+            page_size_input.wait_for(state="visible", timeout=10000)
+            progress["active_stage"] = "select-target-page-size-by-keyboard"
+            target_index = progress["available_page_size_options"].index(page_size)
+            page_size_input.press("Home", timeout=10000)
+            for _ in range(target_index):
+                page_size_input.press("ArrowDown", timeout=10000)
+            page_size_input.press("Enter", timeout=10000)
+            progress["target_option_selected_by_keyboard"] = True
+            after_click_state = read_dom_state()
+            progress["page_size_control_value_after_selection"] = after_click_state.get("page_size_control_value")
+            progress["ej2_page_size_after_selection"] = after_click_state.get("ej2_page_size")
+            progress["dropdown_open_after_selection"] = bool(after_click_state.get("dropdown_opened"))
             progress["active_stage"] = "wait-page-size-grid-render"
             wait_for_grid_state(1, page_size, min(page_size, total_count))
             progress["active_stage"] = "capture-page-size-result"

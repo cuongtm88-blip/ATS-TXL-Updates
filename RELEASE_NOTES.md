@@ -1,3 +1,10 @@
+## Bản test chẩn đoán OneBSS grid 1.1.26-diagnostic
+
+- Sửa chọn page size của grid EJ2 bằng bàn phím trên đúng dropdown của grid;
+  xác nhận input và footer cập nhật trước khi đọc dữ liệu.
+- Giữ nguyên production export và dừng deep-diagnostic trước Test D, Export
+  Excel hoặc Telegram.
+
 ## Bản test xuất Excel không qua Chrome Download Manager 1.1.16-diagnostic
 
 - Bản thử nghiệm chỉ dành cho Windows test; không phải bản chính thức và
