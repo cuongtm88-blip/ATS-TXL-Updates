@@ -583,6 +583,9 @@ ONEBSS_PAGE_SIZE_STATE_SCRIPT = r"""(allowedSizes) => {
     const associatedPopups = popupRefs.map(id => document.getElementById(id))
         .filter(Boolean).map(element => element.closest('.e-popup') || element)
         .filter((element, index, all) => all.indexOf(element) === index && visible(element));
+    const popupContent = popupRefs.map(id => document.getElementById(id))
+        .find(element => element &&
+            associatedPopups.includes(element.closest('.e-popup') || element)) || null;
     const openPopups = [...document.querySelectorAll('.e-popup.e-popup-open')].filter(visible);
     const numericOptions = popup => [...popup.querySelectorAll('*')]
         .filter(element => visible(element) && !element.children.length)
@@ -607,7 +610,8 @@ ONEBSS_PAGE_SIZE_STATE_SCRIPT = r"""(allowedSizes) => {
         trigger_found: Boolean(trigger && visible(trigger)),
         dropdown_opened: Boolean(popup && (associatedPopups.includes(popup) || openPopups.includes(popup))),
         options: popup ? [...new Set(numericOptions(popup))].sort((a, b) => a - b) : [],
-        popup_index: popupIndex >= 0 ? popupIndex : null
+        popup_index: popupIndex >= 0 ? popupIndex : null,
+        popup_id: popupContent?.id || popup?.id || null
     };
 }"""
 
@@ -3602,7 +3606,8 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                     const currentPageNode = pager?.querySelector('.e-currentitem, [aria-current="page"]');
                     const actualPage = Number.isInteger(instance?.pageSettings?.currentPage)
                         ? instance.pageSettings.currentPage : Number((currentPageNode?.textContent || '').trim());
-                    const rows = [...root.querySelectorAll('tbody tr')].filter(row =>
+                    const contentBody = root.querySelector('.e-gridcontent tbody');
+                    const rows = [...(contentBody?.querySelectorAll('tr') || [])].filter(row =>
                         row.querySelectorAll('td').length > 0 && row.closest('.e-grid') === root &&
                         !row.matches('.e-filterbar, .e-emptyrow, .e-summaryrow, [aria-hidden="true"]'));
                     const spinner = root.querySelector('.e-spinner-pane.e-spin-show');
@@ -3615,7 +3620,7 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                         rangeStart === expectedStart && rangeEnd === expectedEnd &&
                         rows.length === expectedRows && !spinner;
                 }""",
-                {"pageNumber": page_number, "pageSize": page_size, "expectedRows": expected_rows},
+                arg={"pageNumber": page_number, "pageSize": page_size, "expectedRows": expected_rows},
                 timeout=30000,
             )
 
@@ -3646,12 +3651,12 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             progress["target_option_found"] = page_size in progress["available_page_size_options"]
             if not progress["dropdown_opened"] or not progress["target_option_found"]:
                 raise RuntimeError("EJ2 page-size dropdown did not expose the requested option")
-            popup_index = state.get("popup_index")
-            if not isinstance(popup_index, int) or popup_index < 0:
+            popup_id = state.get("popup_id")
+            if not isinstance(popup_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", popup_id):
                 raise RuntimeError("EJ2 page-size popup could not be scoped to its component")
             progress["active_stage"] = "start-grid-rerender-observer"
             observer_started = bool(page.evaluate(ONEBSS_GRID_MUTATION_OBSERVER_SCRIPT, "start"))
-            popup = page.locator(".e-popup:visible").nth(popup_index)
+            popup = page.locator(f'[id="{popup_id}"]')
             option = popup.get_by_text(str(page_size), exact=True).first
             progress["active_stage"] = "wait-target-page-size-option-visible"
             option.wait_for(state="visible", timeout=10000)
