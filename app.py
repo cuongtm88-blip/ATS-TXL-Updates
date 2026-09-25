@@ -185,6 +185,36 @@ def _onebss_grid_page_count(total_count, page_size):
     return (total_count + page_size - 1) // page_size
 
 
+def _onebss_page_size_from_footer(control_value, footer, total_count):
+    """Read the selected page size without mistaking pager numbers for it."""
+    control_match = re.fullmatch(r"\s*(\d+)\s*", str(control_value or ""))
+    control_size = int(control_match.group(1)) if control_match else None
+    if control_size not in ONEBSS_GRID_PAGE_SIZES:
+        control_size = None
+
+    range_match = re.search(
+        r"Đang hiển thị bản ghi số\s*([\d.,]+)\s*đến\s*([\d.,]+)",
+        str(footer or ""),
+        re.IGNORECASE,
+    )
+    displayed_range = None
+    if range_match:
+        start = int(re.sub(r"\D", "", range_match.group(1)))
+        end = int(re.sub(r"\D", "", range_match.group(2)))
+        if start > 0 and end >= start:
+            displayed_range = (start, end)
+
+    # When there are more records after the displayed range on page 1, the
+    # footer is authoritative even if EJ2's pageSettings value is stale.
+    if displayed_range and displayed_range[0] == 1 and displayed_range[1] < total_count:
+        return displayed_range[1]
+    if control_size is not None:
+        return control_size
+    if displayed_range:
+        return displayed_range[1] - displayed_range[0] + 1
+    return None
+
+
 def _parse_onebss_total_count(text):
     if not isinstance(text, str):
         return None
@@ -453,15 +483,26 @@ ONEBSS_GRID_READ_SCRIPT = r"""() => {
             !row.matches('.e-filterbar, .e-emptyrow, .e-summaryrow, [aria-hidden="true"]'))}))
         .sort((a, b) => b.rows.length - a.rows.length)[0];
     const domRows = contentTable?.rows || [];
-    const pager = root.querySelector('.e-pager, [class*="pager"]') ||
-        root.parentElement?.querySelector('.e-pager, [class*="pager"]') || null;
+    const pagerCandidates = [
+        ...root.querySelectorAll('.e-pager'),
+        ...(root.parentElement ? [...root.parentElement.querySelectorAll('.e-pager')] : [])
+    ];
+    const pager = pagerCandidates.find(element => {
+        const text = (element.innerText || '').toLowerCase();
+        return element.querySelector('.e-pagesizes') &&
+            (text.includes('tổng cộng') || text.includes('bản ghi trên trang'));
+    }) || null;
     const pageSizeInput = pager?.querySelector(
-        '.e-pagesizes input[role="combobox"], .e-dropdownlist input[role="combobox"], input[role="combobox"], input'
+        '.e-pagesizes .e-pagerdropdown input.e-dropdownlist, .e-pagesizes .e-pagerdropdown input, .e-pagesizes select.e-ddl-hidden, .e-pagesizes select'
     ) || null;
     const pageSettings = gridInstance?.pageSettings || null;
-    const sizeFromInput = String(pageSizeInput?.value || '').match(/\d+/);
-    const currentPageSize = Number.isInteger(pageSettings?.pageSize)
-        ? pageSettings.pageSize : sizeFromInput ? Number(sizeFromInput[0]) : null;
+    const sizeFromInput = String(pageSizeInput?.value || '').match(/^\s*(\d+)\s*$/);
+    const footerRange = (pager?.innerText || '').match(
+        /Đang hiển thị bản ghi số\s*([\d.,]+)\s*đến\s*([\d.,]+)/i
+    );
+    const currentPageSize = sizeFromInput ? Number(sizeFromInput[1]) : footerRange
+        ? Number(footerRange[2].replace(/\D/g, '')) - Number(footerRange[1].replace(/\D/g, '')) + 1
+        : null;
     const currentPageNode = pager?.querySelector('.e-currentitem, [aria-current="page"]') || null;
     const currentPage = Number.isInteger(pageSettings?.currentPage)
         ? pageSettings.currentPage
@@ -510,36 +551,107 @@ ONEBSS_PAGE_SIZE_STATE_SCRIPT = r"""(allowedSizes) => {
         return headers.some(value => value.includes(norm('Mã thuê bao'))) &&
             headers.some(value => value.includes(norm('Mã báo hỏng')));
     });
-    if (!root) return {page_size_control_found: false, initial_page_size_detected: null, footer: '', dropdown_opened: false, options: []};
-    const pager = root.querySelector('.e-pager, [class*="pager"]') ||
-        root.parentElement?.querySelector('.e-pager, [class*="pager"]') || null;
-    const controls = pager ? [...pager.querySelectorAll(
-        '.e-pagesizes input, .e-dropdownlist input, input[role="combobox"]'
-    )] : [];
+    if (!root) return {page_size_control_found: false, page_size_control_value: null, initial_page_size_detected: null, footer: '', dropdown_opened: false, options: [], popup_index: null};
     const visible = element => {
         const style = getComputedStyle(element);
         const rect = element.getBoundingClientRect();
         return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
     };
-    const control = controls.find(visible) || null;
-    const instance = root.ej2_instances?.find(item => item.pageSettings && typeof item.getColumns === 'function');
-    const inputMatch = String(control?.value || '').match(/\d+/);
-    const initialPageSize = Number.isInteger(instance?.pageSettings?.pageSize)
-        ? instance.pageSettings.pageSize : inputMatch ? Number(inputMatch[0]) : null;
+    const pagerCandidates = [
+        ...root.querySelectorAll('.e-pager'),
+        ...(root.parentElement ? [...root.parentElement.querySelectorAll('.e-pager')] : [])
+    ];
+    const pager = pagerCandidates.find(element => {
+        const text = norm(element.innerText);
+        return element.querySelector('.e-pagesizes') &&
+            (text.includes(norm('Tổng cộng')) || text.includes(norm('bản ghi trên trang')));
+    }) || null;
+    const pageSizes = pager?.querySelector('.e-pagesizes') || null;
+    const pagerDropdown = pageSizes?.querySelector('.e-pagerdropdown') || null;
+    const dropdown = pagerDropdown?.querySelector('.e-input-group.e-ddl, [role="listbox"]') || null;
+    const control = pagerDropdown?.querySelector('input.e-dropdownlist, input, select.e-ddl-hidden, select') || null;
+    const visibleInput = pagerDropdown?.querySelector('input.e-dropdownlist, input');
+    const nativeSelect = pagerDropdown?.querySelector('select.e-ddl-hidden, select');
+    const controlValue = (visibleInput?.value || nativeSelect?.value || control?.value) ?? null;
     const footer = (pager?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300);
-    const popups = [...document.querySelectorAll('.e-popup')].filter(visible);
-    const optionTexts = popups.flatMap(popup => [...popup.querySelectorAll('*')]
+    const popupRefs = [...new Set([
+        ...(control?.getAttribute('aria-controls') || '').split(/\s+/),
+        ...(control?.getAttribute('aria-owns') || '').split(/\s+/),
+        ...(dropdown?.getAttribute('aria-controls') || '').split(/\s+/),
+        ...(dropdown?.getAttribute('aria-owns') || '').split(/\s+/)
+    ].filter(Boolean))];
+    const associatedPopups = popupRefs.map(id => document.getElementById(id))
+        .filter(Boolean).map(element => element.closest('.e-popup') || element)
+        .filter((element, index, all) => all.indexOf(element) === index && visible(element));
+    const openPopups = [...document.querySelectorAll('.e-popup.e-popup-open')].filter(visible);
+    const numericOptions = popup => [...popup.querySelectorAll('*')]
         .filter(element => visible(element) && !element.children.length)
-        .map(element => (element.innerText || element.textContent || '').trim()));
-    const options = [...new Set(optionTexts.map(text => /^\d+$/.test(text) ? Number(text) : null)
-        .filter(value => allowedSizes.includes(value)))].sort((a, b) => a - b);
+        .map(element => (element.innerText || element.textContent || '').trim())
+        .map(text => /^\d+$/.test(text) ? Number(text) : null)
+        .filter(value => allowedSizes.includes(value));
+    const popup = associatedPopups[0] || openPopups.find(element => numericOptions(element).length) || null;
+    const visiblePopups = [...document.querySelectorAll('.e-popup')].filter(visible);
+    const popupIndex = popup ? visiblePopups.indexOf(popup) : -1;
+    const range = footer.match(/Đang hiển thị bản ghi số\s*([\d.,]+)\s*đến\s*([\d.,]+)/i);
+    const footerPageSize = range
+        ? Number(range[2].replace(/\D/g, '')) - Number(range[1].replace(/\D/g, '')) + 1
+        : null;
+    const inputMatch = String(controlValue || '').match(/^\s*(\d+)\s*$/);
+    const initialPageSize = inputMatch ? Number(inputMatch[1]) : footerPageSize;
+    const trigger = pagerDropdown?.querySelector('.e-input-group-icon, .e-ddl-icon') || dropdown;
     return {
-        page_size_control_found: Boolean(control),
+        page_size_control_found: Boolean(pageSizes && pagerDropdown && dropdown && control && visible(pageSizes) && visible(dropdown)),
+        page_size_control_value: controlValue,
         initial_page_size_detected: initialPageSize,
         footer,
-        dropdown_opened: Boolean(control?.getAttribute('aria-expanded') === 'true' || popups.length),
-        options
+        trigger_found: Boolean(trigger && visible(trigger)),
+        dropdown_opened: Boolean(popup && (associatedPopups.includes(popup) || openPopups.includes(popup))),
+        options: popup ? [...new Set(numericOptions(popup))].sort((a, b) => a - b) : [],
+        popup_index: popupIndex >= 0 ? popupIndex : null
     };
+}"""
+
+
+ONEBSS_PAGE_SIZE_POPUP_OPEN_SCRIPT = r"""() => {
+    const norm = value => (value || '').normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase();
+    const visible = element => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    const root = [...document.querySelectorAll('.e-grid, [role="grid"]')].find(element => {
+        const headers = [...element.querySelectorAll('th,[role="columnheader"]')].map(node => norm(node.textContent));
+        return headers.some(value => value.includes(norm('Mã thuê bao'))) &&
+            headers.some(value => value.includes(norm('Mã báo hỏng')));
+    });
+    if (!root) return false;
+    const pagers = [
+        ...root.querySelectorAll('.e-pager'),
+        ...(root.parentElement ? [...root.parentElement.querySelectorAll('.e-pager')] : [])
+    ];
+    const pager = pagers.find(element => {
+        const text = norm(element.innerText);
+        return element.querySelector('.e-pagesizes') &&
+            (text.includes(norm('Tổng cộng')) || text.includes(norm('bản ghi trên trang')));
+    });
+    const pagerDropdown = pager?.querySelector('.e-pagesizes .e-pagerdropdown');
+    const dropdown = pagerDropdown?.querySelector('.e-input-group.e-ddl, [role="listbox"]');
+    const control = pagerDropdown?.querySelector('input.e-dropdownlist, input, select.e-ddl-hidden, select');
+    if (!pagerDropdown || !dropdown || !control) return false;
+    const refs = [
+        ...(control.getAttribute('aria-controls') || '').split(/\s+/),
+        ...(control.getAttribute('aria-owns') || '').split(/\s+/),
+        ...(dropdown.getAttribute('aria-controls') || '').split(/\s+/),
+        ...(dropdown.getAttribute('aria-owns') || '').split(/\s+/)
+    ].filter(Boolean);
+    const associated = refs.map(id => document.getElementById(id)).filter(Boolean)
+        .map(element => element.closest('.e-popup') || element).some(visible);
+    const openNumericPopup = [...document.querySelectorAll('.e-popup.e-popup-open')].some(popup =>
+        visible(popup) && [...popup.querySelectorAll('*')].some(option =>
+            visible(option) && !option.children.length && /^\d+$/.test((option.innerText || option.textContent || '').trim())
+        )
+    );
+    return associated || openNumericPopup;
 }"""
 
 
@@ -3440,8 +3552,13 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
         def read_dom_state():
             state = page.evaluate(ONEBSS_PAGE_SIZE_STATE_SCRIPT, list(ONEBSS_GRID_PAGE_SIZES))
             progress["page_size_control_found"] = state.get("page_size_control_found")
-            if progress["initial_page_size_detected"] is None:
-                progress["initial_page_size_detected"] = state.get("initial_page_size_detected")
+            detected_size = _onebss_page_size_from_footer(
+                state.get("page_size_control_value"), state.get("footer"), total_count
+            )
+            if detected_size is not None:
+                state["initial_page_size_detected"] = detected_size
+                if progress["initial_page_size_detected"] is None:
+                    progress["initial_page_size_detected"] = detected_size
             if state.get("options"):
                 progress["available_page_size_options"] = state["options"]
             progress["dropdown_opened"] = progress["dropdown_opened"] or bool(state.get("dropdown_opened"))
@@ -3452,6 +3569,12 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             nonlocal latest_snapshot
             progress["active_stage"] = "read-grid-page"
             latest_snapshot = page.evaluate(ONEBSS_GRID_READ_SCRIPT)
+            state = read_dom_state()
+            latest_snapshot["current_page_size"] = (
+                _onebss_page_size_from_footer(
+                    state.get("page_size_control_value"), state.get("footer"), total_count
+                ) or latest_snapshot.get("current_page_size")
+            )
             return latest_snapshot
 
         def wait_for_grid_state(page_number, page_size, expected_rows):
@@ -3466,10 +3589,16 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                     });
                     if (!root) return false;
                     const instance = root.ej2_instances?.find(item => item.pageSettings && typeof item.getColumns === 'function');
-                    const pager = root.querySelector('.e-pager, [class*="pager"]') || root.parentElement?.querySelector('.e-pager, [class*="pager"]');
-                    const pageSizeInput = pager?.querySelector('.e-pagesizes input[role="combobox"], .e-dropdownlist input[role="combobox"], input[role="combobox"], input');
-                    const inputSize = Number(String(pageSizeInput?.value || '').match(/\d+/)?.[0]);
-                    const actualSize = Number.isInteger(instance?.pageSettings?.pageSize) ? instance.pageSettings.pageSize : inputSize;
+                    const pager = [
+                        ...root.querySelectorAll('.e-pager'),
+                        ...(root.parentElement ? [...root.parentElement.querySelectorAll('.e-pager')] : [])
+                    ].find(element => {
+                        const text = (element.innerText || '').toLowerCase();
+                        return element.querySelector('.e-pagesizes') &&
+                            (text.includes('tổng cộng') || text.includes('bản ghi trên trang'));
+                    });
+                    const pageSizeInput = pager?.querySelector('.e-pagesizes .e-pagerdropdown input.e-dropdownlist, .e-pagesizes .e-pagerdropdown input, .e-pagesizes select.e-ddl-hidden, .e-pagesizes select');
+                    const inputSize = Number(String(pageSizeInput?.value || '').match(/^\s*(\d+)\s*$/)?.[1]);
                     const currentPageNode = pager?.querySelector('.e-currentitem, [aria-current="page"]');
                     const actualPage = Number.isInteger(instance?.pageSettings?.currentPage)
                         ? instance.pageSettings.currentPage : Number((currentPageNode?.textContent || '').trim());
@@ -3477,7 +3606,13 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
                         row.querySelectorAll('td').length > 0 && row.closest('.e-grid') === root &&
                         !row.matches('.e-filterbar, .e-emptyrow, .e-summaryrow, [aria-hidden="true"]'));
                     const spinner = root.querySelector('.e-spinner-pane.e-spin-show');
-                    return actualPage === pageNumber && actualSize === pageSize &&
+                    const footerRange = (pager?.innerText || '').match(/Đang hiển thị bản ghi số\s*([\d.,]+)\s*đến\s*([\d.,]+)/i);
+                    const rangeStart = footerRange ? Number(footerRange[1].replace(/\D/g, '')) : null;
+                    const rangeEnd = footerRange ? Number(footerRange[2].replace(/\D/g, '')) : null;
+                    const expectedStart = (pageNumber - 1) * pageSize + 1;
+                    const expectedEnd = expectedStart + expectedRows - 1;
+                    return actualPage === pageNumber && inputSize === pageSize &&
+                        rangeStart === expectedStart && rangeEnd === expectedEnd &&
                         rows.length === expectedRows && !spinner;
                 }""",
                 {"pageNumber": page_number, "pageSize": page_size, "expectedRows": expected_rows},
@@ -3490,30 +3625,34 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             progress["active_stage"] = "inspect-page-size-control"
             state = read_dom_state()
             progress["footer_before"] = state.get("footer", "")
-            if progress["initial_page_size_detected"] is None:
-                progress["initial_page_size_detected"] = state.get("initial_page_size_detected")
-            dropdown = page.locator(
-                ".e-pager .e-pagesizes input, "
-                ".e-pager .e-dropdownlist input, "
-                ".e-pager input[role='combobox']"
-            ).first
+            pager = page.locator(".e-pager:has(.e-pagesizes)").filter(has_text="Tổng cộng").first
+            page_sizes = pager.locator(".e-pagesizes").first
+            dropdown = page_sizes.locator(".e-pagerdropdown").first
             progress["active_stage"] = "wait-page-size-control-visible"
+            page_sizes.wait_for(state="visible", timeout=10000)
             dropdown.wait_for(state="visible", timeout=10000)
             progress["page_size_control_found"] = True
             progress["active_stage"] = "open-page-size-dropdown"
-            dropdown.click(timeout=10000)
+            trigger = dropdown.locator(".e-input-group-icon:visible, .e-ddl-icon:visible").first
+            if trigger.count():
+                trigger.click(timeout=10000)
+            else:
+                dropdown.click(timeout=10000)
             progress["active_stage"] = "inspect-open-page-size-dropdown"
+            page.wait_for_function(ONEBSS_PAGE_SIZE_POPUP_OPEN_SCRIPT, timeout=10000)
             state = read_dom_state()
             progress["dropdown_opened"] = bool(state.get("dropdown_opened"))
             progress["available_page_size_options"] = state.get("options", [])
             progress["target_option_found"] = page_size in progress["available_page_size_options"]
             if not progress["dropdown_opened"] or not progress["target_option_found"]:
                 raise RuntimeError("EJ2 page-size dropdown did not expose the requested option")
+            popup_index = state.get("popup_index")
+            if not isinstance(popup_index, int) or popup_index < 0:
+                raise RuntimeError("EJ2 page-size popup could not be scoped to its component")
             progress["active_stage"] = "start-grid-rerender-observer"
             observer_started = bool(page.evaluate(ONEBSS_GRID_MUTATION_OBSERVER_SCRIPT, "start"))
-            option = page.locator(".e-popup:visible").get_by_text(
-                str(page_size), exact=True
-            ).first
+            popup = page.locator(".e-popup:visible").nth(popup_index)
+            option = popup.get_by_text(str(page_size), exact=True).first
             progress["active_stage"] = "wait-target-page-size-option-visible"
             option.wait_for(state="visible", timeout=10000)
             progress["target_option_found"] = True
@@ -3551,11 +3690,15 @@ foreach($root in @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive","$env:
             progress["active_stage"] = "read-initial-grid-snapshot"
             initial_snapshot = page.evaluate(ONEBSS_GRID_READ_SCRIPT)
             latest_snapshot = initial_snapshot
-            progress["initial_page_size_detected"] = initial_snapshot.get("current_page_size")
             progress["target_page_size"] = _onebss_grid_page_size(total_count)
             initial_state = read_dom_state()
+            initial_snapshot["current_page_size"] = (
+                _onebss_page_size_from_footer(
+                    initial_state.get("page_size_control_value"), initial_state.get("footer"), total_count
+                ) or initial_snapshot.get("current_page_size")
+            )
             if progress["initial_page_size_detected"] is None:
-                progress["initial_page_size_detected"] = initial_state.get("initial_page_size_detected")
+                progress["initial_page_size_detected"] = initial_snapshot.get("current_page_size")
             progress["footer_before"] = initial_state.get("footer", "")
             aggregate = _collect_onebss_grid_pages(
                 total_count,

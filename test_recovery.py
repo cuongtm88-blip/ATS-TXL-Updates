@@ -44,6 +44,17 @@ def fake_onebss_grid_rows(start, count):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_page_size_uses_grid_footer_range_not_unrelated_pager_number(self):
+        footer = (
+            "1 2 3 4 ... 12 bản ghi trên trang Tổng cộng 59 bản ghi. "
+            "Đang hiển thị bản ghi số 1 đến 10."
+        )
+        self.assertEqual(app._onebss_page_size_from_footer("12", footer, 59), 10)
+
+    def test_page_size_uses_control_value_when_footer_is_short_only_because_total_is_small(self):
+        footer = "Tổng cộng 59 bản ghi. Đang hiển thị bản ghi số 1 đến 59."
+        self.assertEqual(app._onebss_page_size_from_footer("100", footer, 59), 100)
+
     def test_page_size_timeout_metadata_preserves_initial_grid_snapshot(self):
         snapshot = fake_onebss_grid_snapshot(total_count=57, row_count=10)
         page = Mock()
@@ -54,7 +65,8 @@ class RecoveryTests(unittest.TestCase):
             if script == app.ONEBSS_PAGE_SIZE_STATE_SCRIPT:
                 return {
                     "page_size_control_found": True,
-                    "initial_page_size_detected": 10,
+                    "page_size_control_value": "12",
+                    "initial_page_size_detected": 12,
                     "footer": "Tổng cộng 57 bản ghi. Đang hiển thị bản ghi số 1 đến 10.",
                     "dropdown_opened": False,
                     "options": [],
@@ -64,10 +76,19 @@ class RecoveryTests(unittest.TestCase):
             self.fail("Unexpected page.evaluate script")
 
         page.evaluate.side_effect = evaluate
+        pager = Mock()
+        page_sizes = Mock()
+        page_sizes.wait_for.side_effect = TimeoutError("simulated locator timeout")
         dropdown = Mock()
-        dropdown.wait_for.side_effect = TimeoutError("simulated locator timeout")
+        page_size_collection = Mock()
+        page_size_collection.first = page_sizes
+        dropdown_collection = Mock()
+        dropdown_collection.first = dropdown
+        pager.locator.return_value = page_size_collection
+        page_sizes.locator.return_value = dropdown_collection
         locator = Mock()
-        locator.first = dropdown
+        locator.filter.return_value = locator
+        locator.first = pager
         page.locator.return_value = locator
         state = app.ATSApp.__new__(app.ATSApp)
 
